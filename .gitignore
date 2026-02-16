@@ -1,0 +1,22 @@
+﻿# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+
+# Excel temporary/lock files
+~$*.xlsx
+
+# Generated outputs (adjust if you want to track some)
+output*.xlsx
+output*.pdf
+output*.png
+_tmp_*
+output_case_list.txt
+output_layout.png
+
+# Reports you likely regenerate
+beam_layouts_*.pdf
+beam_layouts_*report*.txt
