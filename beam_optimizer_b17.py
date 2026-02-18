@@ -57,6 +57,8 @@ _DBG_MEMBER_FINAL: List[Dict[str, object]] = []
 _DBG_ALLOC_FINAL: List[Dict[str, object]] = []
 _DBG_PDF_SECTION_MAP: List[Dict[str, object]] = []
 _DBG_STEP_MEMBER_LOADS: List[Dict[str, object]] = []
+_INPUT_WARNINGS: List[Dict[str, object]] = []
+STEEL_UNIT_WEIGHT_KN_M3 = 76.98
 _DBG_CTX: Dict[str, object] = {
     "cand_id": "",
     "direction": "",
@@ -76,6 +78,31 @@ def _clear_debug() -> None:
     _DBG_PDF_SECTION_MAP.clear()
     _DBG_STEP_MEMBER_LOADS.clear()
     _DBG_CTX.update({"cand_id": "", "direction": "", "pitch": None, "member_id": "", "member_type": ""})
+
+
+def _clear_input_warnings() -> None:
+    _INPUT_WARNINGS.clear()
+
+
+def _add_input_warning(
+    *,
+    sheet: str,
+    row: int,
+    section: str,
+    field: str,
+    action: str,
+    detail: str,
+    value: object = None,
+) -> None:
+    _INPUT_WARNINGS.append({
+        "sheet": str(sheet),
+        "row": int(row),
+        "section": str(section),
+        "field": str(field),
+        "action": str(action),
+        "detail": str(detail),
+        "value": value,
+    })
 
 
 def _set_dbg_context(
@@ -517,24 +544,25 @@ def approx_h_section_props_mm(h: float, b: float, tw: float, tf: float) -> Tuple
 def get_section_props_m(section: Section) -> Tuple[float, float, float, float]:
     """
     Returns (A[m2], Av[m2], Z[m3], I[m4]).
-    If inputs missing, tries to parse from name and approximate.
+    If A/Av/Z/I is incomplete, tries to parse dims from name and approximate.
+    If A/Av/Z/I is complete, dimensions are not required.
     """
-    h, b, tw, tf = section.h, section.b, section.tw, section.tf
-
-    if any(v is None for v in (h, b, tw, tf)):
-        dims = parse_h_section_dims(section.name)
-        if dims:
-            h, b, tw, tf = dims
-
-    if any(v is None for v in (h, b, tw, tf)):
-        raise ValueError(f"Section dims missing and cannot parse from name: {section.name}")
-
     A_mm2 = section.A_mm2
     Z_mm3 = section.Z_mm3
     I_mm4 = section.I_mm4
     Av_mm2 = section.Av_mm2
 
     if any(v is None for v in (A_mm2, Z_mm3, I_mm4, Av_mm2)):
+        h, b, tw, tf = section.h, section.b, section.tw, section.tf
+        if any(v is None for v in (h, b, tw, tf)):
+            dims = parse_h_section_dims(section.name)
+            if dims:
+                h, b, tw, tf = dims
+        if any(v is None for v in (h, b, tw, tf)):
+            raise ValueError(
+                f"Section properties incomplete and dims unavailable: {section.name} "
+                f"(need A/Av/Z/I or parseable HxBxTwxTf)"
+            )
         A2, I2, Z2, Av2 = approx_h_section_props_mm(float(h), float(b), float(tw), float(tf))
         if A_mm2 is None:
             A_mm2 = A2
@@ -2064,6 +2092,8 @@ def _apply_rule_support_min_length_xy(
     """
     pos_x = _sanitize_positions_for_direction(cfg, "X", positions_x)  # y = const
     pos_y = _sanitize_positions_for_direction(cfg, "Y", positions_y)  # x = const
+    base_pos_x = list(pos_x)
+    base_pos_y = list(pos_y)
     snap = max(cfg.snap_tol, 1e-6)
     global_prefer_x = float(_direction_span(cfg, "X")) <= float(_direction_span(cfg, "Y"))
 
@@ -2077,8 +2107,10 @@ def _apply_rule_support_min_length_xy(
             continue
 
         # At most one additional support beam for this uncovered load.
-        span_if_x = _support_segment_length(float(cfg.Lx), pos_y, x_const, snap)
-        span_if_y = _support_segment_length(float(cfg.Ly), pos_x, y_const, snap)
+        # Decide orientation against the base layout (before support-line additions).
+        # This avoids load-order-dependent flips that can create dangling support segments.
+        span_if_x = _support_segment_length(float(cfg.Lx), base_pos_y, x_const, snap)
+        span_if_y = _support_segment_length(float(cfg.Ly), base_pos_x, y_const, snap)
 
         if span_if_x + 1e-9 < span_if_y:
             pos_x = _add_beam_at_coord(cfg, "X", pos_x, y_const)
@@ -3636,6 +3668,7 @@ def _solve_layout_step_segments(
 @dataclass
 class WorkerResult:
     cand_no: int
+    worker_pid: int
     spec: CandidateSpec
     row: CandidateRow
     sol: Solution
@@ -3845,6 +3878,7 @@ def prepare_stage(cfg: Config, sections: List[Section]) -> Tuple[List[CandidateS
 
 def _worker_eval(args) -> WorkerResult:
     cfg, mat, setts, sections, spec = args
+    worker_pid = os.getpid()
     _clear_debug()
 
     # Layout policy for this version:
@@ -4101,6 +4135,7 @@ def _worker_eval(args) -> WorkerResult:
 
     return WorkerResult(
         cand_no=spec.cand_no,
+        worker_pid=worker_pid,
         spec=spec,
         row=row,
         sol=sol,
@@ -4136,12 +4171,18 @@ def parallel_stage(
     total = len(tasks)
 
     with ProcessPoolExecutor(max_workers=max_workers) as ex:
-        futs = [ex.submit(_worker_eval, t) for t in tasks]
-        for fut in as_completed(futs):
-            results.append(fut.result())
+        fut_to_spec = {ex.submit(_worker_eval, t): t[4] for t in tasks}
+        for fut in as_completed(fut_to_spec):
+            spec = fut_to_spec[fut]
+            try:
+                wr = fut.result()
+            except Exception as e:
+                cand_id = spec.cand_id if spec and spec.cand_id else "UNKNOWN"
+                print(f"[Progress] FAILED case={cand_id} error={type(e).__name__}: {e}")
+                raise
+            results.append(wr)
             done += 1
-            if done % max(1, total // 20) == 0 or done == total:
-                print(f"[Progress] {done}/{total} evaluated")
+            print(f"[Progress] {done}/{total} evaluated case={wr.spec.cand_id} pid={wr.worker_pid}")
 
     results.sort(key=lambda x: x.cand_no)
     return results
@@ -5209,14 +5250,23 @@ def read_point_loads_table(ws) -> List[PointLoad]:
     return loads
 
 
-def read_sections_table(ws) -> List[Section]:
-    hdr = find_table_header(ws, {
+def read_sections_table(
+    ws,
+    *,
+    source_sheet: str = "INPUT",
+    require_use_true: bool = False,
+) -> List[Section]:
+    req = {
         "rank": ["rank"],
         "name": ["sectionname", "section", "name"],
-        "wg": ["w_g", "wg"],
-    }, search_rows=700, search_cols=40)
+    }
+    if require_use_true:
+        req["use"] = ["use", "enabled", "enable", "adopt"]
+    hdr = find_table_header(ws, req, search_rows=700, search_cols=40)
     if hdr is None:
-        raise ValueError("Section Candidates table not found (need Rank, SectionName, w_g).")
+        if require_use_true:
+            raise ValueError('Sheet "SECTION_DB" must have headers: Use, Rank, SectionName.')
+        raise ValueError("Section Candidates table not found (need Rank, SectionName).")
     header_row, cols_req, row_map = hdr
 
     def col_of(*aliases: str) -> Optional[int]:
@@ -5225,66 +5275,270 @@ def read_sections_table(ws) -> List[Section]:
                 return row_map[a]
         return None
 
+    def header_text(col: Optional[int]) -> str:
+        if col is None:
+            return ""
+        v = ws.cell(row=header_row, column=col).value
+        return _norm(v)
+
+    def is_cm_unit(col: Optional[int], order: int) -> bool:
+        t = header_text(col)
+        return (f"cm{order}" in t) or (f"cm^{order}" in t)
+
+    def opt_float(row: int, col: Optional[int]) -> Optional[float]:
+        if col is None:
+            return None
+        v = ws.cell(row=row, column=col).value
+        if v is None or str(v).strip() == "":
+            return None
+        try:
+            return float(v)
+        except Exception as e:
+            raise ValueError(f"Invalid numeric value at {source_sheet}!R{row}C{col}: {v}") from e
+
     c_rank = cols_req["rank"]
     c_name = cols_req["name"]
-    c_wg = cols_req["wg"]
+    c_use = cols_req.get("use", None)
 
+    c_wg = col_of("w_g", "wg")
+    c_unit_mass = col_of("unitmass", "unitmasskgm", "masskgm", "kgm")
     c_h = col_of("h", "hmm")
     c_b = col_of("b", "bmm")
-    c_tw = col_of("tw", "twmm")
-    c_tf = col_of("tf", "tfmm")
-    c_A = col_of("a", "amm2")
-    c_Z = col_of("z", "zmm3")
-    c_I = col_of("i", "imm4")
-    c_Av = col_of("av", "avmm2")
+    c_tw = col_of("tw", "twmm", "t1", "t1mm")
+    c_tf = col_of("tf", "tfmm", "t2", "t2mm")
+    c_A = col_of("a", "amm2", "acm2")
+    c_Z = col_of("z", "zx", "zmm3", "zxmm3", "zcm3", "zxcm3")
+    c_I = col_of("i", "ix", "imm4", "ixmm4", "icm4", "ixcm4")
+    c_Av = col_of("av", "avmm2", "avcm2")
+
+    A_is_cm2 = is_cm_unit(c_A, 2)
+    Z_is_cm3 = is_cm_unit(c_Z, 3)
+    I_is_cm4 = is_cm_unit(c_I, 4)
+    Av_is_cm2 = is_cm_unit(c_Av, 2)
 
     sections: List[Section] = []
+    used_ranks: Dict[int, int] = {}
+    used_names: Dict[str, int] = {}
     r = header_row + 1
     while True:
         rk = ws.cell(row=r, column=c_rank).value
         nm = ws.cell(row=r, column=c_name).value
-        wg = ws.cell(row=r, column=c_wg).value
         if (rk is None or str(rk).strip() == "") and (nm is None or str(nm).strip() == ""):
             break
         if nm is None or str(nm).strip() == "":
-            raise ValueError(f"SectionName missing at row {r}")
-        if wg is None or str(wg).strip() == "":
-            raise ValueError(f"w_g missing at row {r}")
+            raise ValueError(f"SectionName missing at {source_sheet}!R{r}")
+        if rk is None or str(rk).strip() == "":
+            raise ValueError(f"Rank missing at {source_sheet}!R{r}")
         try:
             rank = int(float(rk))
         except Exception as e:
-            raise ValueError(f"Rank invalid at row {r}: {rk}") from e
+            raise ValueError(f"Rank invalid at {source_sheet}!R{r}: {rk}") from e
+        name = str(nm).strip()
 
-        def opt(col: Optional[int]) -> Optional[float]:
-            if col is None:
-                return None
-            v = ws.cell(row=r, column=col).value
-            if v is None or str(v).strip() == "":
-                return None
-            return float(v)
+        if require_use_true and c_use is not None:
+            use_val = ws.cell(row=r, column=c_use).value
+            if not _to_bool(use_val, False):
+                r += 1
+                continue
+
+        if rank in used_ranks:
+            raise ValueError(f"Duplicate Rank in {source_sheet}: {rank} at row {r} (first row {used_ranks[rank]})")
+        if name in used_names:
+            raise ValueError(f"Duplicate SectionName in {source_sheet}: {name} at row {r} (first row {used_names[name]})")
+        used_ranks[rank] = r
+        used_names[name] = r
+
+        h = opt_float(r, c_h)
+        b = opt_float(r, c_b)
+        tw = opt_float(r, c_tw)
+        tf = opt_float(r, c_tf)
+        A_mm2 = opt_float(r, c_A)
+        Z_mm3 = opt_float(r, c_Z)
+        I_mm4 = opt_float(r, c_I)
+        Av_mm2 = opt_float(r, c_Av)
+        unit_mass = opt_float(r, c_unit_mass)
+        wg = opt_float(r, c_wg)
+
+        if A_mm2 is not None and A_is_cm2:
+            A_mm2 *= 100.0
+        if Z_mm3 is not None and Z_is_cm3:
+            Z_mm3 *= 1000.0
+        if I_mm4 is not None and I_is_cm4:
+            I_mm4 *= 10000.0
+        if Av_mm2 is not None and Av_is_cm2:
+            Av_mm2 *= 100.0
+
+        dims_before = (h, b, tw, tf)
+        if any(v is None for v in (h, b, tw, tf)):
+            dims = parse_h_section_dims(name)
+            if dims:
+                h = float(h if h is not None else dims[0])
+                b = float(b if b is not None else dims[1])
+                tw = float(tw if tw is not None else dims[2])
+                tf = float(tf if tf is not None else dims[3])
+                if dims_before != (h, b, tw, tf):
+                    _add_input_warning(
+                        sheet=source_sheet,
+                        row=r,
+                        section=name,
+                        field="h/b/tw/tf",
+                        action="auto_fill",
+                        detail="filled missing dimensions from SectionName pattern",
+                    )
+
+        if all(v is not None for v in (h, b, tw, tf)):
+            A2, I2, Z2, Av2 = approx_h_section_props_mm(float(h), float(b), float(tw), float(tf))
+            if A_mm2 is None:
+                A_mm2 = A2
+                _add_input_warning(
+                    sheet=source_sheet,
+                    row=r,
+                    section=name,
+                    field="A_mm2",
+                    action="auto_fill",
+                    detail="filled from dimensions (approximation)",
+                    value=A_mm2,
+                )
+            if I_mm4 is None:
+                I_mm4 = I2
+                _add_input_warning(
+                    sheet=source_sheet,
+                    row=r,
+                    section=name,
+                    field="I_mm4",
+                    action="auto_fill",
+                    detail="filled from dimensions (approximation)",
+                    value=I_mm4,
+                )
+            if Z_mm3 is None:
+                Z_mm3 = Z2
+                _add_input_warning(
+                    sheet=source_sheet,
+                    row=r,
+                    section=name,
+                    field="Z_mm3",
+                    action="auto_fill",
+                    detail="filled from dimensions (approximation)",
+                    value=Z_mm3,
+                )
+            if Av_mm2 is None:
+                Av_mm2 = Av2
+                _add_input_warning(
+                    sheet=source_sheet,
+                    row=r,
+                    section=name,
+                    field="Av_mm2",
+                    action="auto_fill",
+                    detail="filled from dimensions (tw*(h-2*tf))",
+                    value=Av_mm2,
+                )
+
+        if wg is None:
+            if unit_mass is not None:
+                wg = float(unit_mass) * 9.80665 / 1000.0
+                _add_input_warning(
+                    sheet=source_sheet,
+                    row=r,
+                    section=name,
+                    field="w_g",
+                    action="auto_fill",
+                    detail="filled from UnitMass[kg/m] * 9.80665 / 1000",
+                    value=wg,
+                )
+            elif A_mm2 is not None:
+                wg = float(A_mm2) * 1e-6 * STEEL_UNIT_WEIGHT_KN_M3
+                _add_input_warning(
+                    sheet=source_sheet,
+                    row=r,
+                    section=name,
+                    field="w_g",
+                    action="auto_fill",
+                    detail=f"filled from A * steel unit weight ({STEEL_UNIT_WEIGHT_KN_M3} kN/m3)",
+                    value=wg,
+                )
+            else:
+                raise ValueError(
+                    f"w_g missing and cannot be reconstructed at {source_sheet}!R{r}: {name} "
+                    "(need UnitMass or A)"
+                )
+
+        if any(v is None for v in (A_mm2, Z_mm3, I_mm4, Av_mm2)):
+            raise ValueError(
+                f"Section properties incomplete at {source_sheet}!R{r}: {name} "
+                "(need A/Av/Z/I, or dimensions to reconstruct)"
+            )
 
         sections.append(Section(
             rank=rank,
-            name=str(nm).strip(),
+            name=name,
             w_g=float(wg),
-            h=opt(c_h),
-            b=opt(c_b),
-            tw=opt(c_tw),
-            tf=opt(c_tf),
-            A_mm2=opt(c_A),
-            Z_mm3=opt(c_Z),
-            I_mm4=opt(c_I),
-            Av_mm2=opt(c_Av),
+            h=h,
+            b=b,
+            tw=tw,
+            tf=tf,
+            A_mm2=A_mm2,
+            Z_mm3=Z_mm3,
+            I_mm4=I_mm4,
+            Av_mm2=Av_mm2,
         ))
         r += 1
 
     sections = sorted(sections, key=lambda s: s.rank)
     if not sections:
-        raise ValueError("No sections provided.")
+        raise ValueError(f"No sections provided in sheet {source_sheet}.")
+    if require_use_true:
+        ranks = [s.rank for s in sections]
+        expect = list(range(1, len(sections) + 1))
+        if ranks != expect:
+            raise ValueError(
+                f"SECTION_DB Rank must be contiguous 1..N for enabled rows. got={ranks[:10]}..."
+            )
     return sections
 
 
+def read_section_selection_names(ws) -> List[str]:
+    """
+    Read optional section-selection rows from INPUT sheet.
+    Expected header includes at least SectionName; optional Use column.
+    If table is missing or no rows are provided, returns [].
+    """
+    hdr = find_table_header(
+        ws,
+        {"name": ["sectionname", "section", "name"]},
+        search_rows=800,
+        search_cols=40,
+    )
+    if hdr is None:
+        return []
+    header_row, cols_req, row_map = hdr
+    c_name = cols_req["name"]
+    c_use = row_map.get("use", None)
+
+    out: List[str] = []
+    seen: Dict[str, int] = {}
+    r = header_row + 1
+    while True:
+        nm = ws.cell(row=r, column=c_name).value
+        if nm is None or str(nm).strip() == "":
+            break
+        if c_use is not None:
+            use_val = ws.cell(row=r, column=c_use).value
+            if not _to_bool(use_val, True):
+                r += 1
+                continue
+        name = str(nm).strip()
+        if name in seen:
+            raise ValueError(
+                f"Duplicate SectionName in INPUT selection: {name} at row {r} (first row {seen[name]})"
+            )
+        seen[name] = r
+        out.append(name)
+        r += 1
+    return out
+
+
 def read_input_xlsx(path: str) -> Tuple[Config, Material, SolverSettings, List[Section]]:
+    _clear_input_warnings()
     wb = load_workbook(path, data_only=True)
     if "INPUT" not in wb.sheetnames:
         raise ValueError('Sheet "INPUT" not found.')
@@ -5387,7 +5641,26 @@ def read_input_xlsx(path: str) -> Tuple[Config, Material, SolverSettings, List[S
     setts = SolverSettings(tol=tol, max_iter=max_iter, n_div=n_div)
 
     # --- section table ---
-    sections = read_sections_table(ws)
+    if "SECTION_DB" in wb.sheetnames:
+        db_sections = read_sections_table(
+            wb["SECTION_DB"],
+            source_sheet="SECTION_DB",
+            require_use_true=True,
+        )
+        selected_names = read_section_selection_names(ws)
+        if selected_names:
+            sec_map = {s.name: s for s in db_sections}
+            missing = [nm for nm in selected_names if nm not in sec_map]
+            if missing:
+                miss_txt = ", ".join(missing[:10])
+                raise ValueError(
+                    f"Selected SectionName not found in SECTION_DB (Use=TRUE): {miss_txt}"
+                )
+            sections = [sec_map[nm] for nm in selected_names]
+        else:
+            sections = db_sections
+    else:
+        sections = read_sections_table(ws, source_sheet="INPUT", require_use_true=False)
 
     cfg = Config(
         Lx=Lx, Ly=Ly, q=q, loads=loads, load_share_model=load_share_model,
@@ -5620,6 +5893,599 @@ def write_member_list(ws, row0: int, title: str, sol: Optional[Solution]) -> int
     return r + 2
 
 
+def _resample_ana_arrays_to_fixed_divisions(
+    ana: Dict[str, object],
+    n_div_out: int = 20,
+) -> Tuple[List[float], List[float], List[float], List[float]]:
+    """
+    Resample analysis arrays to equally spaced x over member length.
+    This is for report display only and does not affect design checks.
+    """
+    try:
+        n_out = int(n_div_out)
+    except Exception:
+        n_out = 20
+    n_out = max(1, n_out)
+
+    xs_raw = [float(v) for v in list(ana.get("xs", []))]
+    V_raw = [float(v) for v in list(ana.get("V", []))]
+    M_raw = [float(v) for v in list(ana.get("M", []))]
+    y_raw = [float(v) for v in list(ana.get("y", []))]
+
+    n_raw = len(xs_raw)
+    if n_raw < 2:
+        return xs_raw, V_raw, M_raw, y_raw
+
+    L = float(xs_raw[-1])
+    xs_out = [L * i / n_out for i in range(n_out + 1)]
+
+    def _interp(vals: List[float], xq: float) -> float:
+        if not vals:
+            return float("nan")
+        if len(vals) != n_raw:
+            return float("nan")
+        if xq <= xs_raw[0]:
+            return vals[0]
+        if xq >= xs_raw[-1]:
+            return vals[-1]
+        j = 0
+        while j + 1 < n_raw and xs_raw[j + 1] < xq:
+            j += 1
+        x0, x1 = xs_raw[j], xs_raw[j + 1]
+        v0, v1 = vals[j], vals[j + 1]
+        if abs(x1 - x0) <= 1e-15:
+            return v0
+        t = (xq - x0) / (x1 - x0)
+        return v0 + (v1 - v0) * t
+
+    V_out = [_interp(V_raw, xq) for xq in xs_out]
+    M_out = [_interp(M_raw, xq) for xq in xs_out]
+    y_out = [_interp(y_raw, xq) for xq in xs_out]
+    return xs_out, V_out, M_out, y_out
+
+
+def _resolve_section_for_member(mc: MemberCheck, sections: List[Section]) -> Optional[Section]:
+    sec = next((s for s in sections if s.rank == mc.section_rank and s.name == mc.section_name), None)
+    if sec is None:
+        sec = next((s for s in sections if s.name == mc.section_name), None)
+    return sec
+
+
+def _pick_worst_member(best: Solution) -> Optional[MemberCheck]:
+    if not best.member_checks:
+        return None
+    if best.worst_member_id:
+        mc = next((m for m in best.member_checks if m.beam_id == best.worst_member_id), None)
+        if mc is not None:
+            return mc
+    return max(best.member_checks, key=lambda m: (float(m.util_max), int(m.beam_no), str(m.beam_id)))
+
+
+def _estimate_main_member_slab_share(
+    cfg: Config,
+    best: Solution,
+    mc: MemberCheck,
+) -> Tuple[Optional[float], Optional[float], str]:
+    """
+    Estimate effective slab load share for a MAIN member from selected response values.
+    Returns (q_used, slab_share, note), where slab_share = q_used / q_input.
+    """
+    eps = 1e-12
+    if mc.member_type != "MAIN":
+        return None, None, "member is not MAIN"
+
+    try:
+        q_input = float(cfg.q)
+    except Exception:
+        return None, None, "invalid q_input"
+    if not math.isfinite(q_input):
+        return None, None, "non-finite q_input"
+
+    lsm = str(cfg.load_share_model or "").strip().upper()
+    bg = next((b for b in best.main_geoms if b.beam_id == mc.beam_id), None)
+    if bg is None:
+        return None, None, f"BeamGeom not found: {mc.beam_id}"
+
+    q_used: Optional[float] = None
+    note = ""
+
+    if lsm == "KAMEKKO":
+        L = max(0.0, float(bg.span))
+        tl = max(0.0, float(bg.trib_left))
+        tr = max(0.0, float(bg.trib_right))
+        trib_peak = min(tl, L * 0.5) + min(tr, L * 0.5)
+        if trib_peak > eps:
+            q_used = (float(mc.w_udl_max) - float(mc.w_g)) / trib_peak
+        else:
+            note = "trib_peak too small for KAMEKKO"
+    elif lsm == "ONEWAY":
+        trib_width = max(0.0, float(bg.trib_width))
+        if trib_width > eps:
+            q_used = (float(mc.w_udl) - float(mc.w_g)) / trib_width
+        else:
+            note = "trib_width too small for ONEWAY"
+    else:
+        note = f"unsupported load model: {lsm if lsm else 'UNKNOWN'}"
+
+    if q_used is not None:
+        if not math.isfinite(float(q_used)):
+            q_used = None
+            note = "q_used became non-finite"
+        elif float(q_used) < eps:
+            q_used = 0.0
+
+    slab_share: Optional[float] = None
+    if q_used is not None and q_input > eps:
+        slab_share = float(q_used) / float(q_input)
+        if not math.isfinite(slab_share):
+            slab_share = None
+            note = "slab_share became non-finite"
+        elif slab_share < eps:
+            slab_share = 0.0
+    elif q_used is not None and q_input <= eps:
+        note = "q_input too small"
+
+    return q_used, slab_share, note
+
+
+def _rebuild_member_arrays_for_member(
+    cfg: Config,
+    mat: Material,
+    setts: SolverSettings,
+    sections: List[Section],
+    best: Solution,
+    mc: MemberCheck,
+) -> Tuple[Optional[Section], Optional[Dict[str, object]], str]:
+    sec = _resolve_section_for_member(mc, sections)
+    if sec is None:
+        return None, None, f"Section not found: {mc.section_name} (rank={mc.section_rank})"
+
+    try:
+        if mc.member_type == "MAIN":
+            bg = next((b for b in best.main_geoms if b.beam_id == mc.beam_id), None)
+            if bg is None:
+                return sec, None, f"BeamGeom not found: {mc.beam_id}"
+
+            q_input = float(cfg.q)
+            _q_used, slab_share, share_note = _estimate_main_member_slab_share(cfg, best, mc)
+            if slab_share is not None:
+                q_for_recheck = q_input * float(slab_share)
+                msg = ""
+            else:
+                q_for_recheck = q_input
+                msg = f"q_for_recheck fallback to q_input (slab_share unknown: {share_note})"
+
+            _bc, ana = check_member(
+                member_type="MAIN",
+                span_dir=bg.direction,
+                span=bg.span,
+                pos_or_fixed=bg.pos,
+                left=None,
+                right=None,
+                trib_width=bg.trib_width,
+                trib_left=bg.trib_left,
+                trib_right=bg.trib_right,
+                load_share_model=cfg.load_share_model,
+                q=q_for_recheck,
+                point_loads=bg.point_along,
+                section=sec,
+                mat=mat,
+                setts=setts,
+                return_arrays=True,
+            )
+            return sec, ana, msg
+
+        td = next((t for t in best.transfer_defs if t.tb_id == mc.beam_id), None)
+        if td is None:
+            return sec, None, f"TransferDef not found: {mc.beam_id}"
+        Ltb = td.right_pos - td.left_pos
+        _bc, ana = check_member(
+            member_type="TRANS",
+            span_dir=td.span_dir,
+            span=Ltb,
+            pos_or_fixed=td.fixed_coord,
+            left=td.left_pos,
+            right=td.right_pos,
+            trib_width=0.0,
+            trib_left=0.0,
+            trib_right=0.0,
+            load_share_model="ONEWAY",
+            q=cfg.q,
+            point_loads=[(td.P, td.a_tb)],
+            section=sec,
+            mat=mat,
+            setts=setts,
+            return_arrays=True,
+        )
+        return sec, ana, ""
+    except Exception as e:
+        return sec, None, f"Failed to rebuild arrays: {type(e).__name__}: {e}"
+
+
+def _rebuild_member_arrays_for_best_member(
+    cfg: Config,
+    mat: Material,
+    setts: SolverSettings,
+    sections: List[Section],
+    best: Optional[Solution],
+) -> Tuple[Optional[MemberCheck], Optional[Section], Optional[Dict[str, object]], str]:
+    if best is None or (not best.ok):
+        return None, None, None, "NO FEASIBLE SOLUTION"
+
+    mc = _pick_worst_member(best)
+    if mc is None:
+        return None, None, None, "Worst member not found"
+
+    sec, ana, msg = _rebuild_member_arrays_for_member(cfg, mat, setts, sections, best, mc)
+    if sec is None:
+        return mc, None, None, f"Section not found for worst member: {mc.section_name} (rank={mc.section_rank})"
+    return mc, sec, ana, msg
+
+
+def _format_point_load_positions_for_member(cfg: Config, best: Solution, mc: MemberCheck) -> str:
+    parts: List[str] = []
+
+    if mc.member_type == "MAIN":
+        bg = next((b for b in best.main_geoms if b.beam_id == mc.beam_id), None)
+        if bg is not None:
+            pts = sorted((float(P), float(a)) for P, a in bg.point_along)
+            for i, (P, a) in enumerate(pts, start=1):
+                if str(mc.direction).upper() == "X":
+                    gx = float(a)
+                    gy = float(bg.pos)
+                else:
+                    gx = float(bg.pos)
+                    gy = float(a)
+                parts.append(f"L{i}:P={P:.3g}kN a={a:.3g}m (x={gx:.3g},y={gy:.3g})")
+            if parts:
+                return "; ".join(parts)
+            return "-"
+
+    if mc.member_type == "TRANS":
+        td = next((t for t in best.transfer_defs if t.tb_id == mc.beam_id), None)
+        if td is not None:
+            a = float(td.a_tb)
+            if str(td.span_dir).upper() == "X":
+                gx = float(td.left_pos) + a
+                gy = float(td.fixed_coord)
+            else:
+                gx = float(td.fixed_coord)
+                gy = float(td.left_pos) + a
+            return f"{td.load_id}:P={float(td.P):.3g}kN a={a:.3g}m (x={gx:.3g},y={gy:.3g})"
+
+    if int(mc.n_point) > 0:
+        return f"{int(mc.n_point)} point load(s) (position detail unavailable)"
+    return "-"
+
+
+def _kamekko_load_detail_for_member(cfg: Config, best: Solution, mc: MemberCheck) -> str:
+    lsm = str(cfg.load_share_model or "").strip().upper()
+    if mc.member_type != "MAIN":
+        return "-"
+    q_input = float(cfg.q)
+    q_input_txt = f"{q_input:.6g}" if math.isfinite(q_input) else "unknown"
+    _q_used, slab_share, note = _estimate_main_member_slab_share(cfg, best, mc)
+    slab_share_txt = (f"{float(slab_share):.6g}" if slab_share is not None else "unknown")
+    bg = next((b for b in best.main_geoms if b.beam_id == mc.beam_id), None)
+    note_suffix = (f"; note={note}" if note else "")
+
+    if bg is None:
+        if lsm == "KAMEKKO":
+            return (
+                "w(x)=q_input*slab_share*(min(tl,x,L-x)+min(tr,x,L-x))+w_g; "
+                f"q_input={q_input_txt}, slab_share={slab_share_txt}, tl=unknown, tr=unknown, L=unknown{note_suffix}"
+            )
+        return f"model={lsm if lsm else 'UNKNOWN'}, q_input={q_input_txt}, slab_share={slab_share_txt}{note_suffix}"
+
+    tl = float(bg.trib_left)
+    tr = float(bg.trib_right)
+    L = float(bg.span)
+    if lsm == "KAMEKKO":
+        return (
+            "w(x)=q_input*slab_share*(min(tl,x,L-x)+min(tr,x,L-x))+w_g; "
+            f"q_input={q_input_txt}, slab_share={slab_share_txt}, tl={tl:.6g}, tr={tr:.6g}, L={L:.6g}{note_suffix}"
+        )
+
+    return (
+        f"model={lsm if lsm else 'UNKNOWN'}, q_input={q_input_txt}, slab_share={slab_share_txt}, "
+        f"trib_width={float(bg.trib_width):.6g}{note_suffix}"
+    )
+
+
+def write_calc_best_beams_sheet(
+    wb,
+    cfg: Config,
+    mat: Material,
+    setts: SolverSettings,
+    sections: List[Section],
+    best: Optional[Solution],
+) -> None:
+    if "CALC_BEST_BEAMS" in wb.sheetnames:
+        del wb["CALC_BEST_BEAMS"]
+    ws = wb.create_sheet("CALC_BEST_BEAMS")
+
+    widths = [
+        8, 12, 10, 8, 12, 10, 10, 10, 8, 22, 11, 11, 11, 8,
+        46, 60,
+        12, 12, 9, 11, 11, 9, 10, 10, 9, 10, 10, 8,
+    ]
+    for i, w in enumerate(widths, start=1):
+        set_col_width(ws, i, w)
+
+    ws.cell(row=1, column=1, value="CALC_BEST_BEAMS (Best-case beam calculation sheet)").font = Font(bold=True, size=14)
+
+    if best is None or (not best.ok):
+        ws.cell(row=3, column=1, value="NO FEASIBLE SOLUTION").font = Font(bold=True)
+        return
+
+    def _val_or_blank(v: object, nd: int = 6) -> object:
+        if isinstance(v, (int, float)):
+            fv = float(v)
+            if math.isfinite(fv):
+                return round(fv, nd)
+        return ""
+
+    sum_headers = ["BestDirection", "BestSystem", "BestPitch", "BestPitchY", "TotalWeight[kN]", "UtilMax", "WorstMemberID"]
+    sum_values = [
+        best.direction,
+        best.system,
+        _val_or_blank(best.pitch),
+        _val_or_blank(best.pitch_y) if best.pitch_y is not None else "",
+        _val_or_blank(best.total_weight),
+        _val_or_blank(best.util_max),
+        best.worst_member_id,
+    ]
+    for j, h in enumerate(sum_headers, start=1):
+        write_header(ws, 3, j, h)
+    for j, v in enumerate(sum_values, start=1):
+        ws.cell(row=4, column=j, value=v)
+
+    ws.cell(row=6, column=1, value="Load definition details").font = Font(bold=True)
+    ws.cell(row=7, column=1, value="Concentrated load position format: L#:P=<kN> a=<m> (x=<m>,y=<m>)").font = Font(italic=True)
+    ws.cell(
+        row=8,
+        column=1,
+        value=(
+            "KAMEKKO (MAIN) definition: w(x)=q_input*slab_share*(min(tl,x,L-x)+min(tr,x,L-x))+w_g; "
+            "q_input is INPUT value (fixed display), slab_share is estimated from selected member response (w_avg/w_max)."
+        ),
+    ).font = Font(italic=True)
+    ws.cell(
+        row=9,
+        column=1,
+        value=(
+            "Note: w_avg/w_max are report values. Design judgement (OK/NG) uses Mmax, Vmax, dmax"
+            " -> util_M/util_V/util_d/util_max."
+        ),
+    ).font = Font(italic=True)
+
+    ws.cell(row=10, column=1, value="All beam summary (MAIN+TRANS) - best solution").font = Font(bold=True)
+    headers = [
+        "No", "BeamID", "Type", "Dir", "Pos/Fixed[m]", "Left[m]", "Right[m]", "Span[m]",
+        "Rank", "Section", "w_g[kN/m]", "w_avg[kN/m]", "w_max[kN/m]", "Npoint",
+        "PointLoadPos", "KamekkoDef",
+        "Mmax[kN*m]", "Mallow[kN*m]", "M_ratio",
+        "Vmax[kN]", "Vallow[kN]", "V_ratio",
+        "dmax[mm]", "dallow[mm]", "d_ratio",
+        "Governing", "util_max", "OK/NG",
+    ]
+    for j, h in enumerate(headers, start=1):
+        write_header(ws, 11, j, h)
+
+    checks = sorted(best.member_checks, key=lambda x: (0 if x.member_type == "MAIN" else 1, x.beam_no, x.beam_id))
+    r = 12
+    for mc in checks:
+        sec = _resolve_section_for_member(mc, sections)
+        m_allow: Optional[float] = None
+        v_allow: Optional[float] = None
+        if sec is not None:
+            try:
+                _A_m2, Av_m2, Z_m3, _I_m4 = get_section_props_m(sec)
+                m_allow = float(Z_m3) * float(mat.fb_kN_m2)
+                v_allow = float(Av_m2) * float(mat.fv_kN_m2)
+            except Exception:
+                m_allow = None
+                v_allow = None
+
+        d_allow_mm = float(mc.span) / float(mat.deflection_limit) * 1000.0 if float(mat.deflection_limit) > 0.0 else None
+        m_ratio = float(mc.util_M)
+        v_ratio = float(mc.util_V)
+        d_ratio = float(mc.util_d)
+        ratios = [("M", m_ratio), ("V", v_ratio), ("d", d_ratio)]
+        governing = max(ratios, key=lambda kv: kv[1])[0] if ratios else ""
+        point_pos_txt = _format_point_load_positions_for_member(cfg, best, mc)
+        kamekko_txt = _kamekko_load_detail_for_member(cfg, best, mc)
+
+        out = [
+            mc.beam_no,
+            mc.beam_id,
+            mc.member_type,
+            mc.direction,
+            _val_or_blank(mc.pos_or_fixed),
+            _val_or_blank(mc.left),
+            _val_or_blank(mc.right),
+            _val_or_blank(mc.span),
+            mc.section_rank,
+            mc.section_name,
+            _val_or_blank(mc.w_g),
+            _val_or_blank(mc.w_udl),
+            _val_or_blank(mc.w_udl_max),
+            mc.n_point,
+            point_pos_txt,
+            kamekko_txt,
+            _val_or_blank(mc.Mmax),
+            _val_or_blank(m_allow),
+            _val_or_blank(m_ratio),
+            _val_or_blank(mc.Vmax),
+            _val_or_blank(v_allow),
+            _val_or_blank(v_ratio),
+            _val_or_blank(mc.dmax * 1000.0),
+            _val_or_blank(d_allow_mm),
+            _val_or_blank(d_ratio),
+            governing,
+            _val_or_blank(mc.util_max),
+            "OK" if mc.ok else "NG",
+        ]
+        for j, v in enumerate(out, start=1):
+            ws.cell(row=r, column=j, value=v)
+        ws.cell(row=r, column=15).alignment = Alignment(vertical="center", wrap_text=True)
+        ws.cell(row=r, column=16).alignment = Alignment(vertical="center", wrap_text=True)
+        r += 1
+
+    r += 2
+    ws.cell(row=r, column=1, value="Worst member arrays (x-V-M-deflection)").font = Font(bold=True)
+    r += 1
+
+    mc_worst, sec_worst, ana, msg = _rebuild_member_arrays_for_best_member(cfg, mat, setts, sections, best)
+    if mc_worst is None:
+        ws.cell(row=r, column=1, value=msg if msg else "Worst member not found").font = Font(bold=True)
+        return
+
+    ws.cell(
+        row=r,
+        column=1,
+        value=f"Worst member: {mc_worst.beam_id} (No={mc_worst.beam_no}, type={mc_worst.member_type}, dir={mc_worst.direction}, span={mc_worst.span:g} m)",
+    ).font = Font(bold=True)
+    r += 1
+    if sec_worst is None:
+        ws.cell(row=r, column=1, value=f"Section unresolved: rank={mc_worst.section_rank}, {mc_worst.section_name}").font = Font(bold=True)
+    else:
+        ws.cell(row=r, column=1, value=f"Section: rank={sec_worst.rank}, {sec_worst.name}").font = Font(bold=True)
+    r += 1
+    ws.cell(
+        row=r,
+        column=1,
+        value=f"Point loads: {_format_point_load_positions_for_member(cfg, best, mc_worst)}",
+    ).font = Font(italic=True)
+    r += 1
+    ws.cell(
+        row=r,
+        column=1,
+        value=f"Load model detail: {_kamekko_load_detail_for_member(cfg, best, mc_worst)}",
+    ).font = Font(italic=True)
+    r += 1
+
+    if ana is None:
+        ws.cell(row=r, column=1, value=(msg if msg else "No arrays returned")).font = Font(italic=True)
+        return
+
+    if msg:
+        ws.cell(row=r, column=1, value=msg).font = Font(italic=True)
+        r += 1
+
+    arr_headers = ["x[m]", "V[kN]", "M[kN*m]", "y[mm]"]
+    for c, h in enumerate(arr_headers, start=1):
+        write_header(ws, r, c, h)
+    r += 1
+
+    xs, V, M, y = _resample_ana_arrays_to_fixed_divisions(ana, n_div_out=20)
+    n = len(xs)
+    for i in range(n):
+        ws.cell(row=r, column=1, value=float(xs[i]) if i < len(xs) else None)
+        ws.cell(row=r, column=2, value=float(V[i]) if i < len(V) else None)
+        ws.cell(row=r, column=3, value=float(M[i]) if i < len(M) else None)
+        ws.cell(row=r, column=4, value=(float(y[i]) * 1000.0) if i < len(y) else None)
+        r += 1
+
+    r += 1
+    ws.cell(
+        row=r,
+        column=1,
+        value="All BeamID x/V/M/y arrays are exported to sheet 'CALC_BEST_BEAM_ARRAYS'.",
+    ).font = Font(italic=True)
+
+
+def write_calc_best_beam_arrays_sheet(
+    wb,
+    cfg: Config,
+    mat: Material,
+    setts: SolverSettings,
+    sections: List[Section],
+    best: Optional[Solution],
+) -> None:
+    if "CALC_BEST_BEAM_ARRAYS" in wb.sheetnames:
+        del wb["CALC_BEST_BEAM_ARRAYS"]
+    ws = wb.create_sheet("CALC_BEST_BEAM_ARRAYS")
+    set_col_width(ws, 1, 10)
+    set_col_width(ws, 2, 14)
+    set_col_width(ws, 3, 14)
+    set_col_width(ws, 4, 14)
+
+    ws.cell(row=1, column=1, value="CALC_BEST_BEAM_ARRAYS (all BeamID x-V-M-deflection)").font = Font(bold=True, size=14)
+    ws.cell(row=2, column=1, value="x[m] is fixed to 20 divisions (21 points) for each member.").font = Font(italic=True)
+
+    if best is None or (not best.ok):
+        ws.cell(row=4, column=1, value="NO FEASIBLE SOLUTION").font = Font(bold=True)
+        return
+
+    checks = sorted(best.member_checks, key=lambda x: (0 if x.member_type == "MAIN" else 1, x.beam_no, x.beam_id))
+    r = 4
+    for mc in checks:
+        sec, ana, msg = _rebuild_member_arrays_for_member(cfg, mat, setts, sections, best, mc)
+        ws.cell(
+            row=r,
+            column=1,
+            value=(
+                f"BeamID={mc.beam_id}, No={mc.beam_no}, Type={mc.member_type}, Dir={mc.direction}, "
+                f"Span={mc.span:g}m, Section={mc.section_name}(R{mc.section_rank})"
+            ),
+        ).font = Font(bold=True)
+        r += 1
+
+        if sec is None:
+            ws.cell(row=r, column=1, value=(msg if msg else "Section not found")).font = Font(italic=True)
+            r += 2
+            continue
+        if msg:
+            ws.cell(row=r, column=1, value=msg).font = Font(italic=True)
+            r += 1
+        if ana is None:
+            ws.cell(row=r, column=1, value="No arrays returned").font = Font(italic=True)
+            r += 2
+            continue
+
+        headers = ["x[m]", "V[kN]", "M[kN*m]", "y[mm]"]
+        for c, h in enumerate(headers, start=1):
+            write_header(ws, r, c, h)
+        r += 1
+
+        xs, V, M, y = _resample_ana_arrays_to_fixed_divisions(ana, n_div_out=20)
+        for i in range(len(xs)):
+            ws.cell(row=r, column=1, value=float(xs[i]))
+            ws.cell(row=r, column=2, value=float(V[i]) if i < len(V) else None)
+            ws.cell(row=r, column=3, value=float(M[i]) if i < len(M) else None)
+            ws.cell(row=r, column=4, value=float(y[i]) * 1000.0 if i < len(y) else None)
+            r += 1
+        r += 1
+
+
+def write_input_warnings_sheet(wb) -> None:
+    if "INPUT_WARNINGS" in wb.sheetnames:
+        del wb["INPUT_WARNINGS"]
+    ws = wb.create_sheet("INPUT_WARNINGS")
+
+    headers = ["sheet", "row", "section", "field", "action", "detail", "value"]
+    widths = [16, 8, 28, 16, 14, 64, 18]
+    for c, (h, w) in enumerate(zip(headers, widths), start=1):
+        set_col_width(ws, c, w)
+        ws.cell(row=1, column=c, value=h).font = Font(bold=True)
+
+    if not _INPUT_WARNINGS:
+        ws.cell(row=2, column=1, value="No input warnings.")
+        return
+
+    r = 2
+    for w in _INPUT_WARNINGS:
+        ws.cell(row=r, column=1, value=w.get("sheet"))
+        ws.cell(row=r, column=2, value=w.get("row"))
+        ws.cell(row=r, column=3, value=w.get("section"))
+        ws.cell(row=r, column=4, value=w.get("field"))
+        ws.cell(row=r, column=5, value=w.get("action"))
+        ws.cell(row=r, column=6, value=w.get("detail"))
+        ws.cell(row=r, column=7, value=w.get("value"))
+        r += 1
+
+
 def write_result_xlsx(
     in_path: str,
     out_path: str,
@@ -5646,12 +6512,18 @@ def write_result_xlsx(
     ws.cell(
         row=r,
         column=1,
-        value="Notes: Units are kN, m. E/fb/fv are converted from N/mm2 to kN/m2. Mode-B is removed. Layouts are enumerated by LONG/SHORT split (Raw + Dedup outputs). Concentrated-load support beams are added when needed: if no beam exists at load coordinate, a beam is added in the direction with shorter beam span length at that load point. Added beam count is bounded by uncovered-load count (duplicates merged).",
+        value="Notes: Units are kN, m. E/fb/fv are converted from N/mm2 to kN/m2. Mode-B is removed. Layouts are enumerated by LONG/SHORT split (Raw + Dedup outputs). Concentrated-load support beams are added when needed: if no beam exists at load coordinate, a beam is added in the direction with shorter beam span length at that load point. Added beam count is bounded by uncovered-load count (duplicates merged). w_avg/w_max are report values only; design judgement uses Mmax/Vmax/dmax (util_M/util_V/util_d/util_max).",
     ).font = Font(italic=True)
     r += 2
 
     r = write_solution_summary(ws, r, "Mode-A best (total weight minimum)", best)
     r = write_candidates_table(ws, r, cand_rows)
+    ws.cell(
+        row=r,
+        column=1,
+        value="Note: In the following beam table, w_avg/w_max are reporting fields. Section check pass/fail is based on util_M/util_V/util_d/util_max.",
+    ).font = Font(italic=True)
+    r += 2
 
     r = write_member_checks(ws, r, "Beam checks (per member) - best solution", best)
     r = write_allocations(ws, r, "Load allocation to supports (includes TRANS/MAIN reactions) - best solution", best)
@@ -5660,10 +6532,15 @@ def write_result_xlsx(
     r += 1
     ws.cell(row=r, column=1, value="PLAN view is written to sheet 'LAYOUT' (cells only).").font = Font(italic=True)
 
+    # best-case calculation sheet
+    write_calc_best_beams_sheet(wb, cfg, mat, setts, sections, best)
+    write_calc_best_beam_arrays_sheet(wb, cfg, mat, setts, sections, best)
+
     # layout sheet
     write_layout_sheet(wb, cfg, best)
 
-    # verbose / debug sheets
+    # input warnings + verbose / debug sheets
+    write_input_warnings_sheet(wb)
     write_verbose_sheets(wb, cfg, mat, setts, sections, cand_rows, best)
 
     wb.save(out_path)
@@ -6014,7 +6891,6 @@ def _safe_json(obj: object) -> str:
     except Exception:
         return str(obj)
 
-
 def write_verbose_sheets(
     wb,
     cfg: Config,
@@ -6035,17 +6911,30 @@ def write_verbose_sheets(
       - DEBUG_ALLOC_FINAL : allocations per candidate (incl. TRANS reactions)
       - DEBUG_PDF_SECTION_MAP : per-PDF-segment section mapping result
       - DEBUG_STEP_MEMBER_LOADS : step-segment load composition and chosen section
-      - SAMPLE : arrays (x, V, M, y) for worst member of best solution
     """
     write_trace_sheet(wb)
     write_debug_member_trials_sheet(wb)
-    write_debug_main_geoms_sheet(wb)
-    write_debug_trans_defs_sheet(wb)
-    write_debug_member_final_sheet(wb)
-    write_debug_alloc_final_sheet(wb)
+    if _DBG_MAIN_GEOMS:
+        write_debug_main_geoms_sheet(wb)
+    elif "DEBUG_MAIN_GEOMS" in wb.sheetnames:
+        del wb["DEBUG_MAIN_GEOMS"]
+    if _DBG_TRANS_DEFS:
+        write_debug_trans_defs_sheet(wb)
+    elif "DEBUG_TRANS_DEFS" in wb.sheetnames:
+        del wb["DEBUG_TRANS_DEFS"]
+    if _DBG_MEMBER_FINAL:
+        write_debug_member_final_sheet(wb)
+    elif "DEBUG_MEMBER_FINAL" in wb.sheetnames:
+        del wb["DEBUG_MEMBER_FINAL"]
+    if _DBG_ALLOC_FINAL:
+        write_debug_alloc_final_sheet(wb)
+    elif "DEBUG_ALLOC_FINAL" in wb.sheetnames:
+        del wb["DEBUG_ALLOC_FINAL"]
     write_debug_pdf_section_map_sheet(wb)
     write_debug_step_member_loads_sheet(wb)
-    write_sample_sheet(wb, cfg, mat, setts, sections, best)
+    # SAMPLE sheet is intentionally disabled.
+    if "SAMPLE" in wb.sheetnames:
+        del wb["SAMPLE"]
 
 
 def write_trace_sheet(wb) -> None:
@@ -6308,85 +7197,30 @@ def write_sample_sheet(
         ws.cell(row=3, column=1, value="NO FEASIBLE SOLUTION").font = Font(bold=True)
         return
 
-    worst_id = best.worst_member_id
-    mc = next((m for m in best.member_checks if m.beam_id == worst_id), None)
+    mc, sec, ana, msg = _rebuild_member_arrays_for_best_member(cfg, mat, setts, sections, best)
     if mc is None:
-        ws.cell(row=3, column=1, value="Worst member not found").font = Font(bold=True)
+        ws.cell(row=3, column=1, value=(msg if msg else "Worst member not found")).font = Font(bold=True)
         return
 
-    sec = next((s for s in sections if s.name == mc.section_name and s.rank == mc.section_rank), None)
     if sec is None:
-        sec = next((s for s in sections if s.name == mc.section_name), None)
-    if sec is None:
-        ws.cell(row=3, column=1, value="Section not found for worst member").font = Font(bold=True)
+        ws.cell(row=3, column=1, value=(msg if msg else "Section not found for worst member")).font = Font(bold=True)
         return
 
     ws.cell(row=3, column=1, value=f"Best: dir={best.direction}, pitch={_pitch_text(best.direction, best.pitch, best.pitch_y)}").font = Font(bold=True)
-    ws.cell(row=4, column=1, value=f"Worst member: {worst_id} (No={mc.beam_no}, type={mc.member_type})").font = Font(bold=True)
+    ws.cell(row=4, column=1, value=f"Worst member: {mc.beam_id} (No={mc.beam_no}, type={mc.member_type})").font = Font(bold=True)
     ws.cell(row=5, column=1, value=f"Section: rank={sec.rank}, {sec.name}").font = Font(bold=True)
     ws.cell(row=6, column=1, value=f"util_max={mc.util_max:.3f}, Mmax={mc.Mmax:.3f} kN*m, Vmax={mc.Vmax:.3f} kN, dmax={mc.dmax*1000.0:.3f} mm").font = Font(bold=True)
 
-    # rebuild arrays by re-running check_member with return_arrays=True
-    q_for_recheck = cfg.q * (0.5 if best.direction == "XY" else 1.0)
-
-    if mc.member_type == "MAIN":
-        bg = next((b for b in best.main_geoms if b.beam_id == worst_id), None)
-        if bg is None:
-            ws.cell(row=8, column=1, value="BeamGeom not found").font = Font(bold=True)
-            return
-        bc, ana = check_member(
-            member_type="MAIN",
-            span_dir=bg.direction,
-            span=bg.span,
-            pos_or_fixed=bg.pos,
-            left=None,
-            right=None,
-            trib_width=bg.trib_width,
-            trib_left=bg.trib_left,
-            trib_right=bg.trib_right,
-            load_share_model=cfg.load_share_model,
-            q=q_for_recheck,
-            point_loads=bg.point_along,
-            section=sec,
-            mat=mat,
-            setts=setts,
-            return_arrays=True,
-        )
-    else:
-        td = next((t for t in best.transfer_defs if t.tb_id == worst_id), None)
-        if td is None:
-            ws.cell(row=8, column=1, value="TransferDef not found").font = Font(bold=True)
-            return
-        Ltb = td.right_pos - td.left_pos
-        bc, ana = check_member(
-            member_type="TRANS",
-            span_dir=td.span_dir,
-            span=Ltb,
-            pos_or_fixed=td.fixed_coord,
-            left=td.left_pos,
-            right=td.right_pos,
-            trib_width=0.0,
-            trib_left=0.0,
-            trib_right=0.0,
-            load_share_model="ONEWAY",
-            q=cfg.q,
-            point_loads=[(td.P, td.a_tb)],
-            section=sec,
-            mat=mat,
-            setts=setts,
-            return_arrays=True,
-        )
-
     if ana is None:
-        ws.cell(row=8, column=1, value="No arrays returned").font = Font(bold=True)
+        ws.cell(row=8, column=1, value=(msg if msg else "No arrays returned")).font = Font(bold=True)
         return
 
-    xs = ana.get("xs", [])
-    V = ana.get("V", [])
-    M = ana.get("M", [])
-    y = ana.get("y", [])
+    if msg:
+        ws.cell(row=8, column=1, value=msg).font = Font(italic=True)
 
-    start_r = 9
+    xs, V, M, y = _resample_ana_arrays_to_fixed_divisions(ana, n_div_out=20)
+
+    start_r = 10 if msg else 9
     headers = ["x[m]", "V[kN]", "M[kN*m]", "y[mm]"]
     for c, h in enumerate(headers, start=1):
         ws.cell(row=start_r, column=c, value=h).font = Font(bold=True)
@@ -6423,5 +7257,3 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"[ERROR] {e}", file=sys.stderr)
         sys.exit(1)
-
-
