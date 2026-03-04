@@ -1,2 +1,0 @@
-Original cases: 22\nUnique layouts : 20\nTolerance [m]  : 1e-06\n\nGroup (kept case #3): members=[3, 5]\n  case #3: LONG:2 -> SHORT:3\n  case #5: LONG:3 -> SHORT:2\n
-Group (kept case #13): members=[13, 15]\n  case #13: SHORT:2 -> LONG:2 -> LONG:3\n  case #15: SHORT:2 -> LONG:3 -> LONG:2\n
