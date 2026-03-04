@@ -21,6 +21,49 @@ Section properties:
     If a section name follows "H-350x175x7x11", dimensions (h,b,tw,tf) are
     parsed when explicit section properties are missing. The following
     approximations are used:
+        A  = 2*b*tf + (h-2*tf)*tw
+        I  = 2*(b*tf^3/12 + b*tf*(h/2-tf/2)^2) + tw*(h-2*tf)^3/12
+        Z  = I/(h/2)
+        Av = tw*(h-2*tf)
+"""
+
+
+from __future__ import annotations
+
+import math
+import os
+import re
+import sys
+import json
+from datetime import datetime
+from dataclasses import dataclass, replace
+from typing import Dict, List, Optional, Tuple
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
+from openpyxl import load_workbook
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
+
+
+
+# -----------------------------
+# Trace / Debug (verbose output)
+# -----------------------------
+_TRACE: List[Dict[str, object]] = []
+_DBG_MEMBER_TRIALS: List[Dict[str, object]] = []
+_DBG_MAIN_GEOMS: List[Dict[str, object]] = []
+_DBG_TRANS_DEFS: List[Dict[str, object]] = []
+_DBG_MEMBER_FINAL: List[Dict[str, object]] = []
+_DBG_ALLOC_FINAL: List[Dict[str, object]] = []
+_DBG_PDF_SECTION_MAP: List[Dict[str, object]] = []
+_DBG_STEP_MEMBER_LOADS: List[Dict[str, object]] = []
+_INPUT_WARNINGS: List[Dict[str, object]] = []
+STEEL_UNIT_WEIGHT_KN_M3 = 76.98
+_DBG_CTX: Dict[str, object] = {
+    "cand_id": "",
+    "direction": "",
+    "pitch": None,
+    "member_id": "",
     "member_type": "",
 }
 
@@ -32,7 +75,34 @@ def _clear_debug() -> None:
     _DBG_TRANS_DEFS.clear()
     _DBG_MEMBER_FINAL.clear()
     _DBG_ALLOC_FINAL.clear()
+    _DBG_PDF_SECTION_MAP.clear()
+    _DBG_STEP_MEMBER_LOADS.clear()
     _DBG_CTX.update({"cand_id": "", "direction": "", "pitch": None, "member_id": "", "member_type": ""})
+
+
+def _clear_input_warnings() -> None:
+    _INPUT_WARNINGS.clear()
+
+
+def _add_input_warning(
+    *,
+    sheet: str,
+    row: int,
+    section: str,
+    field: str,
+    action: str,
+    detail: str,
+    value: object = None,
+) -> None:
+    _INPUT_WARNINGS.append({
+        "sheet": str(sheet),
+        "row": int(row),
+        "section": str(section),
+        "field": str(field),
+        "action": str(action),
+        "detail": str(detail),
+        "value": value,
+    })
 
 
 def _set_dbg_context(
@@ -181,6 +251,80 @@ def _dbg_add_alloc_final(cand_id: str, direction: str, pitch: float, alloc_rows:
         })
 
 
+def _dbg_add_pdf_section_map(
+    case_id: str,
+    scope: str,
+    seg_id: str,
+    step: int,
+    typ: str,
+    const: float,
+    x0: float,
+    y0: float,
+    x1: float,
+    y1: float,
+    match_count: int,
+    chosen_rank: str,
+    chosen_section: str,
+    status: str,
+) -> None:
+    _DBG_PDF_SECTION_MAP.append({
+        "case_id": case_id,
+        "scope": scope,
+        "seg_id": seg_id,
+        "step": int(step),
+        "typ": str(typ),
+        "const": float(const),
+        "x0": float(x0),
+        "y0": float(y0),
+        "x1": float(x1),
+        "y1": float(y1),
+        "match_count": int(match_count),
+        "chosen_rank": str(chosen_rank),
+        "chosen_section": str(chosen_section),
+        "status": str(status),
+    })
+
+
+def _dbg_add_step_member_load(
+    case_id: str,
+    seg_id: str,
+    step: int,
+    span: float,
+    left_support: str,
+    right_support: str,
+    udl_model: str,
+    trib_left: float,
+    trib_right: float,
+    trib_width: float,
+    point_loads_external: List[Tuple[str, float, float]],
+    point_loads_from_children: List[Tuple[str, float, float]],
+    Ra: float,
+    Rb: float,
+    chosen_rank: int,
+    chosen_section: str,
+    util_max: float,
+) -> None:
+    _DBG_STEP_MEMBER_LOADS.append({
+        "case_id": str(case_id),
+        "seg_id": str(seg_id),
+        "step": int(step),
+        "span": float(span),
+        "left_support": str(left_support),
+        "right_support": str(right_support),
+        "udl_model": str(udl_model),
+        "trib_left": float(trib_left),
+        "trib_right": float(trib_right),
+        "trib_width": float(trib_width),
+        "point_loads_external": _safe_json(point_loads_external),
+        "point_loads_from_children": _safe_json(point_loads_from_children),
+        "Ra": float(Ra),
+        "Rb": float(Rb),
+        "chosen_rank": int(chosen_rank),
+        "chosen_section": str(chosen_section),
+        "util_max": float(util_max),
+    })
+
+
 # -----------------------------
 # Data models
 # -----------------------------
@@ -239,11 +383,11 @@ class Config:
     # When True (and both X/Y enabled), also evaluate two-direction grid layouts.
     enable_xy_grid: bool
 
-    # edge_beams=True: ピッチ起点を外周(0)に取り、0, pitch, 2pitch...を生成（ただし0とLはPERIM扱いでMAINには置かない）
-    # edge_beams=False: ピッチ/2起点で内側に配置
+    # edge_beams=True : include perimeter beams at 0 and L, plus interior beams by pitch.
+    # edge_beams=False: interior beams only (no perimeter beam at 0/L).
     edge_beams: bool
 
-    # 旧仕様互換（現状は TRANS追加ロジック優先）。残しておくが、load_ruleは直接使わない。
+    # point load support rule selector
     load_rule: int
 
     pitch_start: float
@@ -252,7 +396,7 @@ class Config:
     pitch_list: List[float]
 
     short_pitch_limit: float  # 3.0
-    snap_tol: float           # "on-beam" 判定の許容[m]
+    snap_tol: float           # tolerance for "on-beam" checks [m]
 
 
 @dataclass
@@ -366,10 +510,10 @@ def ensure_positive(name: str, v: float) -> None:
 # -----------------------------
 def parse_h_section_dims(name: str) -> Optional[Tuple[float, float, float, float]]:
     """
-    Parse "H-350x175x7x11" or similar (x, X, ×).
+    Parse "H-350x175x7x11" or similar (x, X, or multiplication sign).
     Returns (h,b,tw,tf) in mm if parse succeeds.
     """
-    s = str(name).replace("×", "x").replace("X", "x")
+    s = str(name).replace("\u00d7", "x").replace("X", "x")
     m = re.search(r"(\d+(\.\d+)?)x(\d+(\.\d+)?)x(\d+(\.\d+)?)x(\d+(\.\d+)?)", s)
     if not m:
         return None
@@ -400,24 +544,25 @@ def approx_h_section_props_mm(h: float, b: float, tw: float, tf: float) -> Tuple
 def get_section_props_m(section: Section) -> Tuple[float, float, float, float]:
     """
     Returns (A[m2], Av[m2], Z[m3], I[m4]).
-    If inputs missing, tries to parse from name and approximate.
+    If A/Av/Z/I is incomplete, tries to parse dims from name and approximate.
+    If A/Av/Z/I is complete, dimensions are not required.
     """
-    h, b, tw, tf = section.h, section.b, section.tw, section.tf
-
-    if any(v is None for v in (h, b, tw, tf)):
-        dims = parse_h_section_dims(section.name)
-        if dims:
-            h, b, tw, tf = dims
-
-    if any(v is None for v in (h, b, tw, tf)):
-        raise ValueError(f"Section dims missing and cannot parse from name: {section.name}")
-
     A_mm2 = section.A_mm2
     Z_mm3 = section.Z_mm3
     I_mm4 = section.I_mm4
     Av_mm2 = section.Av_mm2
 
     if any(v is None for v in (A_mm2, Z_mm3, I_mm4, Av_mm2)):
+        h, b, tw, tf = section.h, section.b, section.tw, section.tf
+        if any(v is None for v in (h, b, tw, tf)):
+            dims = parse_h_section_dims(section.name)
+            if dims:
+                h, b, tw, tf = dims
+        if any(v is None for v in (h, b, tw, tf)):
+            raise ValueError(
+                f"Section properties incomplete and dims unavailable: {section.name} "
+                f"(need A/Av/Z/I or parseable HxBxTwxTf)"
+            )
         A2, I2, Z2, Av2 = approx_h_section_props_mm(float(h), float(b), float(tw), float(tf))
         if A_mm2 is None:
             A_mm2 = A2
@@ -445,8 +590,8 @@ def get_section_props_m(section: Section) -> Tuple[float, float, float, float]:
 # Geometry / beam layout
 # -----------------------------
 def pitch_direction_of(direction: str) -> str:
-    # X方向配置: beams span X, are arrayed along Y => pitch_dir='Y'
-    # Y方向配置: beams span Y, are arrayed along X => pitch_dir='X'
+    # X direction beams span along X and are arranged along Y => pitch_dir='Y'
+    # Y direction beams span along Y and are arranged along X => pitch_dir='X'
     return "Y" if direction == "X" else "X"
 
 
@@ -722,7 +867,7 @@ def analyze_simply_supported_general(
     pls.sort(key=lambda x: x[1])
 
     # distributed load integrals:
-    # I0(x)=∫ w ds, I1(x)=∫ w*s ds  (trapezoid on nodes)
+    # I0(x)=integral(w ds), I1(x)=integral(w*s ds) (trapezoid on nodes)
     I0 = [0.0] * n
     I1 = [0.0] * n
     for i in range(1, n):
@@ -780,7 +925,7 @@ def analyze_simply_supported_general(
     for i in range(1, n):
         intK1[i] = intK1[i - 1] + 0.5 * (K1[i - 1] + K1[i]) * dx
 
-    # enforce y(L)=0 => theta0 = -∫K1 ds / L
+    # enforce y(L)=0 => theta0 = -integral(K1 ds) / L
     theta0 = -intK1[-1] / L
     theta = [theta0 + v for v in K1]
 
@@ -1483,6 +1628,48 @@ class _LayoutBeamSeg:
     y1: float
 
 
+@dataclass(frozen=True)
+class _CalcSegment:
+    seg_id: str
+    step: int
+    typ: str  # "X" / "Y"
+    const: float
+    x0: float
+    y0: float
+    x1: float
+    y1: float
+
+
+@dataclass(frozen=True)
+class _SupportNode:
+    endpoint: str  # "A" / "B"
+    support_kind: str  # "SEG" / "PERIM" / "NONE"
+    support_id: str
+    x: float
+    y: float
+
+
+@dataclass
+class _SegmentLoadState:
+    ext_point_loads: List[Tuple[str, float, float]]  # (load_id, P, a[m])
+    child_point_loads: List[Tuple[str, float, float]]  # (child_seg_id, P, a[m])
+
+
+@dataclass(frozen=True)
+class _EnumLayoutCase:
+    pos_x: Tuple[float, ...]
+    pos_y: Tuple[float, ...]
+    decisions: Tuple[Tuple[str, int], ...]
+    segments: Tuple[_LayoutBeamSeg, ...]
+
+
+@dataclass(frozen=True)
+class _EnumLayoutBundle:
+    raw_cases: Tuple[_EnumLayoutCase, ...]
+    dedup_cases: Tuple[_EnumLayoutCase, ...]
+    raw_to_dedup: Tuple[int, ...]  # raw index -> dedup index (0-based)
+
+
 def _split_layout_rect(rect: _LayoutRect, mode: str, k: int) -> Tuple[List[_LayoutRect], List[Tuple[str, float, _LayoutRect]]]:
     """
     Split one rectangle using mode in {"LONG","SHORT"} and k in {2,3}.
@@ -1614,30 +1801,39 @@ def _enumerate_xy_layout_positions(
     dedup_tol: float = 1e-6,
 ) -> List[Tuple[Tuple[float, ...], Tuple[float, ...], Tuple[Tuple[str, int], ...], Tuple[_LayoutBeamSeg, ...]]]:
     """
-    Enumerate layout cases using rectangle split logic from beam_layout_enum_dedup.py.
-    De-duplication is done on beam segment geometry (not only line positions).
+    Backward-compatible wrapper: returns deduplicated cases only.
+    """
+    bundle = _enumerate_xy_layout_bundle(cfg, max_steps=max_steps, dedup_tol=dedup_tol)
+    return [(c.pos_x, c.pos_y, c.decisions, c.segments) for c in bundle.dedup_cases]
 
-    Returns:
-      (positions_x, positions_y, decisions, segments)
-      - positions_x: y-const lines (X-span members)
-      - positions_y: x-const lines (Y-span members)
+
+def _enumerate_xy_layout_bundle(
+    cfg: Config,
+    max_steps: int = 12,
+    dedup_tol: float = 1e-6,
+) -> _EnumLayoutBundle:
+    """
+    Enumerate layout cases and return both:
+      - raw cases (all branches)
+      - deduplicated cases (by segment geometry signature)
+      - raw_to_dedup mapping
     """
     lim = float(cfg.short_pitch_limit)
     if lim <= 0.0:
-        return []
+        return _EnumLayoutBundle(raw_cases=tuple(), dedup_cases=tuple(), raw_to_dedup=tuple())
 
     eps = 1e-9
     snap = max(cfg.snap_tol, 1e-6)
     stack: List[Tuple[List[_LayoutRect], List[_LayoutBeamSeg], Tuple[Tuple[str, int], ...]]] = [
         ([_LayoutRect(0.0, cfg.Lx, 0.0, cfg.Ly)], [], tuple())
     ]
-    raw_cases: List[Tuple[Tuple[Tuple[str, int], ...], List[_LayoutBeamSeg]]] = []
+    raw_candidates: List[Tuple[Tuple[Tuple[str, int], ...], List[_LayoutBeamSeg]]] = []
 
     while stack:
         rects, beams, decisions = stack.pop()
 
         if all(r.short() <= lim + eps for r in rects):
-            raw_cases.append((decisions, beams))
+            raw_candidates.append((decisions, beams))
             continue
 
         if len(decisions) >= max_steps:
@@ -1651,18 +1847,11 @@ def _enumerate_xy_layout_positions(
                 next_rects, next_beams = _apply_layout_step(rects, beams, len(decisions) + 1, mode, k, lim)
                 stack.append((next_rects, next_beams, decisions + ((mode, k),)))
 
-    raw_cases.sort(key=lambda x: (len(x[0]), x[0]))
-    unique_cases: List[Tuple[Tuple[Tuple[str, int], ...], List[_LayoutBeamSeg]]] = []
-    out: List[Tuple[Tuple[float, ...], Tuple[float, ...], Tuple[Tuple[str, int], ...], Tuple[_LayoutBeamSeg, ...]]] = []
-    seen: set = set()
-    for decisions, beams in raw_cases:
-        sig = _layout_segment_signature(beams, dedup_tol)
-        if sig in seen:
-            continue
-        seen.add(sig)
-        unique_cases.append((decisions, beams))
+    raw_candidates.sort(key=lambda x: (len(x[0]), x[0]))
 
-    for decisions, beams in unique_cases:
+    raw_cases: List[_EnumLayoutCase] = []
+    raw_signatures: List[Tuple[Tuple, ...]] = []
+    for decisions, beams in raw_candidates:
         pos_x = tuple(sorted(set(round(b.const, 10) for b in beams if b.typ == "X" and snap < b.const < cfg.Ly - snap)))
         pos_y = tuple(sorted(set(round(b.const, 10) for b in beams if b.typ == "Y" and snap < b.const < cfg.Lx - snap)))
         if not pos_x and not pos_y:
@@ -1671,10 +1860,35 @@ def _enumerate_xy_layout_positions(
         # Keep only layouts compatible with short-side bay criterion used by this optimizer.
         bay_x = _max_bay_width_from_positions(cfg, "X", list(pos_x))
         bay_y = _max_bay_width_from_positions(cfg, "Y", list(pos_y))
-        if min(bay_x, bay_y) <= lim + eps:
-            out.append((pos_x, pos_y, decisions, tuple(beams)))
+        if min(bay_x, bay_y) > lim + eps:
+            continue
 
-    return out
+        segs = tuple(beams)
+        raw_cases.append(_EnumLayoutCase(
+            pos_x=pos_x,
+            pos_y=pos_y,
+            decisions=decisions,
+            segments=segs,
+        ))
+        raw_signatures.append(_layout_segment_signature(list(segs), dedup_tol))
+
+    dedup_cases: List[_EnumLayoutCase] = []
+    raw_to_dedup: List[int] = []
+    sig_to_dedup: Dict[Tuple[Tuple, ...], int] = {}
+
+    for case, sig in zip(raw_cases, raw_signatures):
+        idx = sig_to_dedup.get(sig)
+        if idx is None:
+            idx = len(dedup_cases)
+            sig_to_dedup[sig] = idx
+            dedup_cases.append(case)
+        raw_to_dedup.append(idx)
+
+    return _EnumLayoutBundle(
+        raw_cases=tuple(raw_cases),
+        dedup_cases=tuple(dedup_cases),
+        raw_to_dedup=tuple(raw_to_dedup),
+    )
 
 
 def _sanitize_positions_for_direction(cfg: Config, direction: str, positions: List[float]) -> List[float]:
@@ -1835,6 +2049,79 @@ def _apply_rule_ac_xy(
                 pos_x = _add_beam_at_coord(cfg, "X", pos_x, cx)
             else:
                 pos_y = _add_beam_at_coord(cfg, "Y", pos_y, cy)
+
+    return (
+        _sanitize_positions_for_direction(cfg, "X", pos_x),
+        _sanitize_positions_for_direction(cfg, "Y", pos_y),
+    )
+
+
+def _apply_rule_support_single_direction(
+    cfg: Config,
+    direction: str,
+    positions: List[float],
+) -> List[float]:
+    """
+    Concentrated-load support rule (single direction):
+      - If no beam exists at a point-load coordinate, add a beam at that coordinate.
+      - No nearest-beam movement is performed.
+    """
+    pos = _sanitize_positions_for_direction(cfg, direction, positions)
+    snap = max(cfg.snap_tol, 1e-6)
+    for _P, coord in _point_load_coords_for_direction(cfg, direction):
+        if _is_on_beam_line(coord, pos, snap):
+            continue
+        pos = _add_beam_at_coord(cfg, direction, pos, coord)
+    return _sanitize_positions_for_direction(cfg, direction, pos)
+
+
+def _apply_rule_support_min_length_xy(
+    cfg: Config,
+    positions_x: List[float],
+    positions_y: List[float],
+) -> Tuple[List[float], List[float]]:
+    """
+    Concentrated-load support rule (XY):
+      - If a load is not on any beam line, add one beam line through the load.
+      - Choose direction with shorter beam span length at that load point.
+        span_if_X: distance between adjacent Y-support lines at load x.
+        span_if_Y: distance between adjacent X-support lines at load y.
+      - No nearest-beam movement is performed.
+      - Added beam count is bounded by uncovered load count
+        (at most one new line per uncovered load; duplicates are merged).
+    """
+    pos_x = _sanitize_positions_for_direction(cfg, "X", positions_x)  # y = const
+    pos_y = _sanitize_positions_for_direction(cfg, "Y", positions_y)  # x = const
+    base_pos_x = list(pos_x)
+    base_pos_y = list(pos_y)
+    snap = max(cfg.snap_tol, 1e-6)
+    global_prefer_x = float(_direction_span(cfg, "X")) <= float(_direction_span(cfg, "Y"))
+
+    loads = sorted(cfg.loads, key=lambda pl: (-float(pl.P), pl.x, pl.y))
+    for pl in loads:
+        y_const = float(pl.y)  # coordinate for X-direction line
+        x_const = float(pl.x)  # coordinate for Y-direction line
+        on_x = _is_on_beam_line(y_const, pos_x, snap)
+        on_y = _is_on_beam_line(x_const, pos_y, snap)
+        if on_x or on_y:
+            continue
+
+        # At most one additional support beam for this uncovered load.
+        # Decide orientation against the base layout (before support-line additions).
+        # This avoids load-order-dependent flips that can create dangling support segments.
+        span_if_x = _support_segment_length(float(cfg.Lx), base_pos_y, x_const, snap)
+        span_if_y = _support_segment_length(float(cfg.Ly), base_pos_x, y_const, snap)
+
+        if span_if_x + 1e-9 < span_if_y:
+            pos_x = _add_beam_at_coord(cfg, "X", pos_x, y_const)
+        elif span_if_y + 1e-9 < span_if_x:
+            pos_y = _add_beam_at_coord(cfg, "Y", pos_y, x_const)
+        else:
+            # Deterministic tie-breaker by global span.
+            if global_prefer_x:
+                pos_x = _add_beam_at_coord(cfg, "X", pos_x, y_const)
+            else:
+                pos_y = _add_beam_at_coord(cfg, "Y", pos_y, x_const)
 
     return (
         _sanitize_positions_for_direction(cfg, "X", pos_x),
@@ -2803,7 +3090,7 @@ def solve_layout_grid_free(
     )
 
 # -----------------------------
-# Optimizer (direction × pitch)
+# Optimizer (direction and pitch)
 # -----------------------------
 @dataclass(frozen=True)
 class CandidateRow:
@@ -2823,6 +3110,12 @@ class CandidateRow:
     ng_reason: str
     pitch_y: Optional[float] = None
     system: str = "SINGLE"
+    case_scope: str = "DIRECT"
+    raw_case_no: Optional[int] = None
+    dedup_case_no: Optional[int] = None
+    mapped_dedup_case_no: Optional[int] = None
+    dedup_group_key: str = ""
+    raw_case_members: Tuple[int, ...] = tuple()
 
 
 @dataclass(frozen=True)
@@ -2837,11 +3130,545 @@ class CandidateSpec:
     pos_y: Optional[Tuple[float, ...]] = None
     enum_decisions: Optional[Tuple[Tuple[str, int], ...]] = None
     enum_segments: Optional[Tuple[_LayoutBeamSeg, ...]] = None
+    case_scope: str = "DIRECT"
+    raw_case_no: Optional[int] = None
+    dedup_case_no: Optional[int] = None
+    mapped_dedup_case_no: Optional[int] = None
+    dedup_group_key: str = ""
+    raw_case_members: Tuple[int, ...] = tuple()
+
+
+def _segment_length(seg: _CalcSegment) -> float:
+    return math.hypot(float(seg.x1) - float(seg.x0), float(seg.y1) - float(seg.y0))
+
+
+def _segment_point_on(seg: _CalcSegment, x: float, y: float, tol: float) -> bool:
+    xx = float(x)
+    yy = float(y)
+    if seg.typ == "X":
+        if abs(yy - float(seg.const)) > tol:
+            return False
+        lo, hi = sorted((float(seg.x0), float(seg.x1)))
+        return (lo - tol) <= xx <= (hi + tol)
+    if abs(xx - float(seg.const)) > tol:
+        return False
+    lo, hi = sorted((float(seg.y0), float(seg.y1)))
+    return (lo - tol) <= yy <= (hi + tol)
+
+
+def _segment_a_from_xy(seg: _CalcSegment, x: float, y: float) -> float:
+    if seg.typ == "X":
+        left = min(float(seg.x0), float(seg.x1))
+        return max(0.0, min(float(x) - left, abs(float(seg.x1) - float(seg.x0))))
+    low = min(float(seg.y0), float(seg.y1))
+    return max(0.0, min(float(y) - low, abs(float(seg.y1) - float(seg.y0))))
+
+
+def _initial_positions_for_spec(cfg: Config, spec: CandidateSpec) -> Tuple[List[float], List[float], bool]:
+    pos_x: List[float] = list(spec.pos_x) if spec.pos_x is not None else []
+    pos_y: List[float] = list(spec.pos_y) if spec.pos_y is not None else []
+    resolved = (spec.pos_x is not None) or (spec.pos_y is not None)
+
+    if not resolved:
+        if spec.system == "SINGLE" and spec.direction == "X":
+            pos_x = _positions_from_pitch(cfg, "X", spec.pitch)
+            resolved = True
+        elif spec.system == "SINGLE" and spec.direction == "Y":
+            pos_y = _positions_from_pitch(cfg, "Y", spec.pitch)
+            resolved = True
+        elif spec.system == "GRID" and spec.pitch_y is not None:
+            pos_x = _positions_from_pitch(cfg, "X", spec.pitch)
+            pos_y = _positions_from_pitch(cfg, "Y", spec.pitch_y)
+            resolved = True
+
+    return (
+        _sanitize_positions_for_direction(cfg, "X", pos_x),
+        _sanitize_positions_for_direction(cfg, "Y", pos_y),
+        resolved,
+    )
+
+
+def _cut_points_for_segments(vals: List[float], lo: float, hi: float, eps: float = 1e-9) -> List[float]:
+    out = [float(lo), float(hi)]
+    for v in vals:
+        vv = min(max(float(v), float(lo)), float(hi))
+        out.append(vv)
+    out = sorted(out)
+    uniq: List[float] = []
+    for v in out:
+        if not uniq or abs(v - uniq[-1]) > eps:
+            uniq.append(v)
+    if len(uniq) < 2:
+        return [float(lo), float(hi)]
+    return uniq
+
+
+def _split_support_lines_as_segments(
+    cfg: Config,
+    base_segs: List[Tuple[str, int, str, float, float, float, float, float]],
+    ac_lines: List[Tuple[str, float]],
+    step: int,
+) -> List[Tuple[str, int, str, float, float, float, float, float]]:
+    eps = 1e-9
+    out: List[Tuple[str, int, str, float, float, float, float, float]] = []
+    aid = 1
+    ac_norm = sorted(set((str(t), round(float(c), 10)) for t, c in ac_lines))
+    for typ, const in ac_norm:
+        if typ == "X":
+            cuts_x: List[float] = [0.0, float(cfg.Lx)]
+            for _sid, _st, btyp, _bc, x0, y0, x1, y1 in base_segs:
+                if btyp != "Y":
+                    continue
+                ylo = min(y0, y1) - eps
+                yhi = max(y0, y1) + eps
+                if ylo <= const <= yhi:
+                    cuts_x.append(float(x0))
+            for at, ac in ac_norm:
+                if at == "Y":
+                    cuts_x.append(float(ac))
+            xs = _cut_points_for_segments(cuts_x, 0.0, float(cfg.Lx), eps=eps)
+            for a, b in zip(xs[:-1], xs[1:]):
+                if b - a <= eps:
+                    continue
+                out.append((f"A{aid}", int(step), "X", float(const), float(a), float(const), float(b), float(const)))
+                aid += 1
+        else:
+            cuts_y: List[float] = [0.0, float(cfg.Ly)]
+            for _sid, _st, btyp, _bc, x0, y0, x1, y1 in base_segs:
+                if btyp != "X":
+                    continue
+                xlo = min(x0, x1) - eps
+                xhi = max(x0, x1) + eps
+                if xlo <= const <= xhi:
+                    cuts_y.append(float(y0))
+            for at, ac in ac_norm:
+                if at == "X":
+                    cuts_y.append(float(ac))
+            ys = _cut_points_for_segments(cuts_y, 0.0, float(cfg.Ly), eps=eps)
+            for a, b in zip(ys[:-1], ys[1:]):
+                if b - a <= eps:
+                    continue
+                out.append((f"A{aid}", int(step), "Y", float(const), float(const), float(a), float(const), float(b)))
+                aid += 1
+    return out
+
+
+def _build_calc_segments_for_spec(cfg: Config, spec: CandidateSpec) -> List[_CalcSegment]:
+    base: List[Tuple[str, int, str, float, float, float, float, float]] = []
+    max_step = 1
+
+    if spec.enum_segments:
+        for i, s in enumerate(spec.enum_segments, start=1):
+            step = int(s.step)
+            max_step = max(max_step, step)
+            base.append((
+                f"B{i}",
+                step,
+                str(s.typ),
+                round(float(s.const), 10),
+                float(s.x0),
+                float(s.y0),
+                float(s.x1),
+                float(s.y1),
+            ))
+    else:
+        pos_x, pos_y, _resolved = _initial_positions_for_spec(cfg, spec)
+        bid = 1
+        for yy in pos_x:
+            base.append((f"B{bid}", 1, "X", round(float(yy), 10), 0.0, float(yy), float(cfg.Lx), float(yy)))
+            bid += 1
+        for xx in pos_y:
+            base.append((f"B{bid}", 1, "Y", round(float(xx), 10), float(xx), 0.0, float(xx), float(cfg.Ly)))
+            bid += 1
+
+    if not base:
+        return []
+
+    existing_lines = {(t, c) for _, _, t, c, *_ in base}
+    ac_lines: List[Tuple[str, float]] = []
+    pos_x0, pos_y0, resolved = _initial_positions_for_spec(cfg, spec)
+    uncovered_loads: List[PointLoad] = []
+    if resolved and cfg.loads:
+        tol = max(cfg.snap_tol, 1e-6)
+        for pl in cfg.loads:
+            on_x = _is_on_beam_line(float(pl.y), pos_x0, tol)
+            on_y = _is_on_beam_line(float(pl.x), pos_y0, tol)
+            if not (on_x or on_y):
+                uncovered_loads.append(pl)
+
+        pos_x_sup, pos_y_sup = _apply_rule_support_min_length_xy(cfg, pos_x0, pos_y0)
+        for yy in pos_x_sup:
+            key = ("X", round(float(yy), 10))
+            if key in existing_lines:
+                continue
+            existing_lines.add(key)
+            ac_lines.append(("X", float(yy)))
+        for xx in pos_y_sup:
+            key = ("Y", round(float(xx), 10))
+            if key in existing_lines:
+                continue
+            existing_lines.add(key)
+            ac_lines.append(("Y", float(xx)))
+
+    if ac_lines:
+        ac_segs = _split_support_lines_as_segments(cfg, base, ac_lines, max_step + 1)
+        tol = max(cfg.snap_tol, 1e-6)
+        target_loads = uncovered_loads if uncovered_loads else list(cfg.loads)
+        ac_kept: List[Tuple[str, int, str, float, float, float, float, float]] = []
+        for _sid, st, typ, const, x0, y0, x1, y1 in ac_segs:
+            has_load = False
+            if typ == "X":
+                lo, hi = sorted((float(x0), float(x1)))
+                for pl in target_loads:
+                    if abs(float(pl.y) - float(const)) <= tol and (lo - tol) <= float(pl.x) <= (hi + tol):
+                        has_load = True
+                        break
+            else:
+                lo, hi = sorted((float(y0), float(y1)))
+                for pl in target_loads:
+                    if abs(float(pl.x) - float(const)) <= tol and (lo - tol) <= float(pl.y) <= (hi + tol):
+                        has_load = True
+                        break
+            if has_load:
+                ac_kept.append(("", int(st), typ, float(const), float(x0), float(y0), float(x1), float(y1)))
+
+        for aid, (_sid, st, typ, const, x0, y0, x1, y1) in enumerate(ac_kept, start=1):
+            base.append((f"A{aid}", int(st), typ, const, x0, y0, x1, y1))
+
+    out: List[_CalcSegment] = [
+        _CalcSegment(seg_id=sid, step=int(st), typ=str(typ), const=float(const), x0=float(x0), y0=float(y0), x1=float(x1), y1=float(y1))
+        for sid, st, typ, const, x0, y0, x1, y1 in base
+    ]
+    out.sort(key=lambda s: (int(s.step), int("".join(ch for ch in s.seg_id if ch.isdigit()) or "999999"), s.seg_id))
+    return out
+
+
+def _solve_layout_step_segments(
+    cfg: Config,
+    mat: Material,
+    setts: SolverSettings,
+    sections: List[Section],
+    spec: CandidateSpec,
+    cand_id: str,
+    system: str,
+) -> Solution:
+    segs = _build_calc_segments_for_spec(cfg, spec)
+    if spec.dedup_case_no is not None:
+        dbg_case_id = f"D{int(spec.dedup_case_no):03d}"
+    elif spec.raw_case_no is not None:
+        dbg_case_id = f"R{int(spec.raw_case_no):03d}"
+    else:
+        dbg_case_id = str(spec.cand_id)
+
+    if not segs:
+        return Solution(
+            direction=spec.direction,
+            pitch=math.inf,
+            pitch_y=math.inf if spec.direction == "XY" else None,
+            system=system,
+            total_weight=math.inf,
+            max_rank_used=10**9,
+            Mmax=0.0,
+            Vmax=0.0,
+            dmax=0.0,
+            util_max=math.inf,
+            ok=False,
+            ng_reason="No calculable segments.",
+            member_checks=[],
+            main_geoms=[],
+            transfer_defs=[],
+            allocation_rows=[],
+            worst_member_id="",
+        )
+
+    tol = max(cfg.snap_tol, 1e-6)
+    seg_map = {s.seg_id: s for s in segs}
+    by_step: Dict[int, List[_CalcSegment]] = {}
+    for s in segs:
+        by_step.setdefault(int(s.step), []).append(s)
+    step_desc = sorted(by_step.keys(), reverse=True)
+
+    const_x = sorted(set(round(float(s.const), 10) for s in segs if s.typ == "X"))
+    const_y = sorted(set(round(float(s.const), 10) for s in segs if s.typ == "Y"))
+
+    def _trib_for(seg: _CalcSegment) -> Tuple[float, float, float]:
+        if seg.typ == "X":
+            vals = const_x
+            width = float(cfg.Ly)
+        else:
+            vals = const_y
+            width = float(cfg.Lx)
+        if not vals:
+            return 0.0, 0.0, 0.0
+        idx = min(range(len(vals)), key=lambda i: abs(vals[i] - float(seg.const)))
+        p = float(vals[idx])
+        left_support = 0.0 if idx == 0 else float(vals[idx - 1])
+        right_support = width if idx == len(vals) - 1 else float(vals[idx + 1])
+        left_bd = 0.5 * (left_support + p)
+        right_bd = 0.5 * (p + right_support)
+        trib_left = max(0.0, p - left_bd)
+        trib_right = max(0.0, right_bd - p)
+        trib_width = trib_left + trib_right
+        return trib_left, trib_right, trib_width
+
+    def _perim_id(seg: _CalcSegment, x: float, y: float) -> str:
+        if seg.typ == "X":
+            if abs(float(x)) <= tol:
+                return "PERIM_X0"
+            if abs(float(x) - float(cfg.Lx)) <= tol:
+                return "PERIM_XL"
+        else:
+            if abs(float(y)) <= tol:
+                return "PERIM_Y0"
+            if abs(float(y) - float(cfg.Ly)) <= tol:
+                return "PERIM_YL"
+        if abs(float(x)) <= tol:
+            return "PERIM_X0"
+        if abs(float(x) - float(cfg.Lx)) <= tol:
+            return "PERIM_XL"
+        if abs(float(y)) <= tol:
+            return "PERIM_Y0"
+        if abs(float(y) - float(cfg.Ly)) <= tol:
+            return "PERIM_YL"
+        return "PERIM_UNKNOWN"
+
+    supports: Dict[str, Tuple[_SupportNode, _SupportNode]] = {}
+    for seg in segs:
+        nodes: List[_SupportNode] = []
+        for endpoint, x, y in (("A", seg.x0, seg.y0), ("B", seg.x1, seg.y1)):
+            on_perim = (
+                abs(float(x)) <= tol or
+                abs(float(x) - float(cfg.Lx)) <= tol or
+                abs(float(y)) <= tol or
+                abs(float(y) - float(cfg.Ly)) <= tol
+            )
+            if on_perim:
+                nodes.append(_SupportNode(endpoint=endpoint, support_kind="PERIM", support_id=_perim_id(seg, x, y), x=float(x), y=float(y)))
+                continue
+
+            cands = [
+                p for p in segs
+                if p.seg_id != seg.seg_id and int(p.step) < int(seg.step) and _segment_point_on(p, x, y, tol)
+            ]
+            if not cands:
+                cands = [
+                    p for p in segs
+                    if p.seg_id != seg.seg_id and _segment_point_on(p, x, y, tol)
+                ]
+            if cands:
+                cands.sort(key=lambda p: (-int(p.step), _segment_length(p), p.seg_id))
+                parent = cands[0]
+                nodes.append(_SupportNode(endpoint=endpoint, support_kind="SEG", support_id=parent.seg_id, x=float(x), y=float(y)))
+            else:
+                nodes.append(_SupportNode(endpoint=endpoint, support_kind="NONE", support_id="UNSUPPORTED", x=float(x), y=float(y)))
+
+        supports[seg.seg_id] = (nodes[0], nodes[1])
+
+    ext_map: Dict[str, List[Tuple[str, float, float]]] = {s.seg_id: [] for s in segs}
+    for pl in cfg.loads:
+        cands = [s for s in segs if _segment_point_on(s, float(pl.x), float(pl.y), tol)]
+        if not cands:
+            continue
+        cands.sort(key=lambda s: (-int(s.step), _segment_length(s), s.seg_id))
+        chosen = cands[0]
+        a = _segment_a_from_xy(chosen, float(pl.x), float(pl.y))
+        ext_map[chosen.seg_id].append((str(pl.load_id), float(pl.P), float(a)))
+
+    incoming: Dict[str, List[Tuple[str, float, float]]] = {s.seg_id: [] for s in segs}
+    load_states: Dict[str, _SegmentLoadState] = {
+        s.seg_id: _SegmentLoadState(ext_point_loads=list(ext_map.get(s.seg_id, [])), child_point_loads=[])
+        for s in segs
+    }
+
+    member_checks: List[MemberCheck] = []
+    allocation_rows: List[Tuple[str, str, float]] = []
+    main_geoms: List[BeamGeom] = []
+
+    for step in step_desc:
+        for seg in sorted(by_step.get(step, []), key=lambda s: s.seg_id):
+            left_node, right_node = supports[seg.seg_id]
+            if left_node.support_kind == "NONE" or right_node.support_kind == "NONE":
+                return Solution(
+                    direction=spec.direction,
+                    pitch=math.inf,
+                    pitch_y=math.inf if spec.direction == "XY" else None,
+                    system=system,
+                    total_weight=math.inf,
+                    max_rank_used=10**9,
+                    Mmax=0.0,
+                    Vmax=0.0,
+                    dmax=0.0,
+                    util_max=math.inf,
+                    ok=False,
+                    ng_reason=f"Unsupported segment endpoint: {seg.seg_id}",
+                    member_checks=[],
+                    main_geoms=[],
+                    transfer_defs=[],
+                    allocation_rows=[],
+                    worst_member_id="",
+                )
+
+            trib_left, trib_right, trib_width = _trib_for(seg)
+            span = _segment_length(seg)
+            if span <= 1e-9:
+                continue
+
+            ext_pts = list(ext_map.get(seg.seg_id, []))
+            child_pts = list(incoming.get(seg.seg_id, []))
+            load_states[seg.seg_id].ext_point_loads = list(ext_pts)
+            load_states[seg.seg_id].child_point_loads = list(child_pts)
+            pts = [(float(P), float(a)) for _lid, P, a in ext_pts] + [(float(P), float(a)) for _sid, P, a in child_pts]
+
+            if seg.typ == "X":
+                left_axis = min(float(seg.x0), float(seg.x1))
+                right_axis = max(float(seg.x0), float(seg.x1))
+            else:
+                left_axis = min(float(seg.y0), float(seg.y1))
+                right_axis = max(float(seg.y0), float(seg.y1))
+
+            _set_dbg_context(cand_id=cand_id, direction=seg.typ, pitch=float(seg.const), member_id=seg.seg_id, member_type="MAIN")
+            chosen = choose_section_for_member(
+                member_type="MAIN",
+                span_dir=seg.typ,
+                span=span,
+                pos_or_fixed=float(seg.const),
+                left=left_axis,
+                right=right_axis,
+                trib_width=trib_width,
+                trib_left=trib_left,
+                trib_right=trib_right,
+                load_share_model=cfg.load_share_model,
+                q=cfg.q,
+                point_loads=pts,
+                sections=sections,
+                mat=mat,
+                setts=setts,
+            )
+            if chosen is None:
+                return Solution(
+                    direction=spec.direction,
+                    pitch=math.inf,
+                    pitch_y=math.inf if spec.direction == "XY" else None,
+                    system=system,
+                    total_weight=math.inf,
+                    max_rank_used=10**9,
+                    Mmax=0.0,
+                    Vmax=0.0,
+                    dmax=0.0,
+                    util_max=math.inf,
+                    ok=False,
+                    ng_reason=f"No feasible section for segment {seg.seg_id}",
+                    member_checks=[],
+                    main_geoms=[],
+                    transfer_defs=[],
+                    allocation_rows=[],
+                    worst_member_id="",
+                )
+
+            mc = replace(chosen, beam_id=seg.seg_id)
+            member_checks.append(mc)
+
+            _dbg_add_step_member_load(
+                case_id=dbg_case_id,
+                seg_id=seg.seg_id,
+                step=int(seg.step),
+                span=float(span),
+                left_support=left_node.support_id,
+                right_support=right_node.support_id,
+                udl_model=str(cfg.load_share_model),
+                trib_left=float(trib_left),
+                trib_right=float(trib_right),
+                trib_width=float(trib_width),
+                point_loads_external=list(ext_pts),
+                point_loads_from_children=list(child_pts),
+                Ra=float(mc.Ra),
+                Rb=float(mc.Rb),
+                chosen_rank=int(mc.section_rank),
+                chosen_section=str(mc.section_name),
+                util_max=float(mc.util_max),
+            )
+
+            for node, R in ((left_node, float(mc.Ra)), (right_node, float(mc.Rb))):
+                if node.support_kind == "SEG":
+                    parent = seg_map.get(node.support_id)
+                    if parent is not None:
+                        a_parent = _segment_a_from_xy(parent, float(node.x), float(node.y))
+                        incoming[parent.seg_id].append((seg.seg_id, R, float(a_parent)))
+                else:
+                    allocation_rows.append((f"{seg.seg_id}_{node.endpoint}", node.support_id, R))
+
+            main_geoms.append(BeamGeom(
+                beam_id=seg.seg_id,
+                direction=seg.typ,
+                pos=float(seg.const),
+                span=float(span),
+                trib_width=float(trib_width),
+                trib_left=float(trib_left),
+                trib_right=float(trib_right),
+                point_along=[(float(P), float(a)) for _lid, P, a in ext_pts] + [(float(P), float(a)) for _sid, P, a in child_pts],
+            ))
+
+    seg_step_map = {s.seg_id: int(s.step) for s in segs}
+    member_checks.sort(key=lambda m: (seg_step_map.get(m.beam_id, 10**9), m.beam_id))
+    member_checks = [replace(mc, beam_no=i) for i, mc in enumerate(member_checks, start=1)]
+
+    total_weight = 0.0
+    max_rank_used = 0
+    Mmax = Vmax = dmax = util_max = 0.0
+    worst_id = ""
+    worst_u = -1.0
+    for mc in member_checks:
+        total_weight += mc.w_g * mc.span
+        max_rank_used = max(max_rank_used, int(mc.section_rank))
+        Mmax = max(Mmax, float(mc.Mmax))
+        Vmax = max(Vmax, float(mc.Vmax))
+        dmax = max(dmax, float(mc.dmax))
+        util_max = max(util_max, float(mc.util_max))
+        if float(mc.util_max) > worst_u:
+            worst_u = float(mc.util_max)
+            worst_id = str(mc.beam_id)
+
+    has_x = any(s.typ == "X" for s in segs)
+    has_y = any(s.typ == "Y" for s in segs)
+    if has_x and has_y:
+        direction = "XY"
+    elif has_x:
+        direction = "X"
+    else:
+        direction = "Y"
+
+    pos_x = sorted(set(round(float(s.const), 10) for s in segs if s.typ == "X"))
+    pos_y = sorted(set(round(float(s.const), 10) for s in segs if s.typ == "Y"))
+    pitch_x = _calc_layout_pitch_from_positions(cfg, "X", pos_x) if pos_x else float(cfg.Ly)
+    pitch_y = _calc_layout_pitch_from_positions(cfg, "Y", pos_y) if pos_y else float(cfg.Lx)
+    pitch = pitch_x if direction != "Y" else pitch_y
+
+    ok = util_max <= 1.0
+    return Solution(
+        direction=direction,
+        pitch=float(pitch),
+        pitch_y=(float(pitch_y) if direction == "XY" else None),
+        system=system,
+        total_weight=float(total_weight),
+        max_rank_used=int(max_rank_used),
+        Mmax=float(Mmax),
+        Vmax=float(Vmax),
+        dmax=float(dmax),
+        util_max=float(util_max),
+        ok=bool(ok),
+        ng_reason=("" if ok else "Some member failed."),
+        member_checks=member_checks,
+        main_geoms=main_geoms,
+        transfer_defs=[],
+        allocation_rows=allocation_rows,
+        worst_member_id=worst_id,
+    )
 
 
 @dataclass
 class WorkerResult:
     cand_no: int
+    worker_pid: int
     spec: CandidateSpec
     row: CandidateRow
     sol: Solution
@@ -2851,6 +3678,7 @@ class WorkerResult:
     dbg_trans_defs: List[Dict[str, object]]
     dbg_member_final: List[Dict[str, object]]
     dbg_alloc_final: List[Dict[str, object]]
+    dbg_step_member_loads: List[Dict[str, object]]
 
 
 def input_stage(in_path: str) -> Tuple[Config, Material, SolverSettings, List[Section]]:
@@ -2922,6 +3750,7 @@ def prepare_stage(cfg: Config, sections: List[Section]) -> Tuple[List[CandidateS
                 direction="X",
                 pitch=pitch,
                 system="SINGLE",
+                case_scope="DIRECT",
             ))
 
     if cfg.enable_y and not need_secondary_y:
@@ -2933,6 +3762,7 @@ def prepare_stage(cfg: Config, sections: List[Section]) -> Tuple[List[CandidateS
                 direction="Y",
                 pitch=pitch,
                 system="SINGLE",
+                case_scope="DIRECT",
             ))
 
     allow_xy = (
@@ -2943,10 +3773,20 @@ def prepare_stage(cfg: Config, sections: List[Section]) -> Tuple[List[CandidateS
     )
     if allow_xy:
         lim = float(cfg.short_pitch_limit)
-        enum_cases = _enumerate_xy_layout_positions(cfg)
-        for pos_x_enum, pos_y_enum, dec, segs in enum_cases:
-            pos_x = tuple(round(float(v), 10) for v in pos_x_enum)
-            pos_y = tuple(round(float(v), 10) for v in pos_y_enum)
+        enum_bundle = _enumerate_xy_layout_bundle(cfg)
+        enum_cases = list(enum_bundle.dedup_cases)
+        dedup_to_raw: Dict[int, List[int]] = {}
+        for raw_idx0, dedup_idx0 in enumerate(enum_bundle.raw_to_dedup):
+            dedup_to_raw.setdefault(int(dedup_idx0), []).append(int(raw_idx0) + 1)  # 1-based raw case no
+
+        for dedup_idx0, case in enumerate(enum_cases):
+            dedup_no = dedup_idx0 + 1
+            pos_x = tuple(round(float(v), 10) for v in case.pos_x)
+            pos_y = tuple(round(float(v), 10) for v in case.pos_y)
+            dec = case.decisions
+            segs = case.segments
+            raw_members = tuple(sorted(dedup_to_raw.get(dedup_idx0, [])))
+            group_key = f"G{dedup_no:03d}"
 
             if pos_x and pos_y:
                 cand_no += 1
@@ -2961,6 +3801,11 @@ def prepare_stage(cfg: Config, sections: List[Section]) -> Tuple[List[CandidateS
                     pos_y=pos_y,
                     enum_decisions=dec,
                     enum_segments=tuple(segs),
+                    case_scope="DEDUP",
+                    dedup_case_no=dedup_no,
+                    mapped_dedup_case_no=dedup_no,
+                    dedup_group_key=group_key,
+                    raw_case_members=raw_members,
                 ))
                 continue
 
@@ -2975,6 +3820,11 @@ def prepare_stage(cfg: Config, sections: List[Section]) -> Tuple[List[CandidateS
                     pos_x=pos_x,
                     enum_decisions=dec,
                     enum_segments=tuple(segs),
+                    case_scope="DEDUP",
+                    dedup_case_no=dedup_no,
+                    mapped_dedup_case_no=dedup_no,
+                    dedup_group_key=group_key,
+                    raw_case_members=raw_members,
                 ))
                 continue
 
@@ -2989,6 +3839,11 @@ def prepare_stage(cfg: Config, sections: List[Section]) -> Tuple[List[CandidateS
                     pos_y=pos_y,
                     enum_decisions=dec,
                     enum_segments=tuple(segs),
+                    case_scope="DEDUP",
+                    dedup_case_no=dedup_no,
+                    mapped_dedup_case_no=dedup_no,
+                    dedup_group_key=group_key,
+                    raw_case_members=raw_members,
                 ))
 
         # Fallback: if no enumerated case is available, keep classic XY pitch candidates.
@@ -3007,6 +3862,7 @@ def prepare_stage(cfg: Config, sections: List[Section]) -> Tuple[List[CandidateS
                         pitch=pitch_x,
                         pitch_y=pitch_y,
                         system="GRID",
+                        case_scope="DIRECT",
                     ))
 
     if not specs:
@@ -3022,75 +3878,233 @@ def prepare_stage(cfg: Config, sections: List[Section]) -> Tuple[List[CandidateS
 
 def _worker_eval(args) -> WorkerResult:
     cfg, mat, setts, sections, spec = args
+    worker_pid = os.getpid()
     _clear_debug()
 
-    if spec.system == "GRID":
+    # Layout policy for this version:
+    # place concentrated-load support beams by adding beams under loads.
+    # If no beam exists at a load coordinate, choose the direction with
+    # shorter beam span length and add a beam line there.
+    use_point_load_support_layout = True
+    use_step_segment_model = (
+        use_point_load_support_layout
+        and spec.system in ("ENUM_X", "ENUM_Y", "GRID_ENUM", "SINGLE")
+        and (spec.enum_segments is not None or spec.system == "SINGLE")
+    )
+
+    def _has_added_positions(base: List[float], sup: List[float], tol: float = 1e-9) -> bool:
+        b = sorted(set(round(float(v), 10) for v in base))
+        s = sorted(set(round(float(v), 10) for v in sup))
+        for sv in s:
+            if all(abs(sv - bv) > tol for bv in b):
+                return True
+        return False
+
+    if use_step_segment_model:
+        sol = _solve_layout_step_segments(
+            cfg=cfg,
+            mat=mat,
+            setts=setts,
+            sections=sections,
+            spec=spec,
+            cand_id=spec.cand_id,
+            system=f"{spec.system}_SUP",
+        )
+    elif spec.system == "GRID":
         if spec.pitch_y is None:
             raise ValueError(f"GRID candidate requires pitch_y: {spec}")
-        sol = solve_layout_grid(cfg, mat, setts, sections, spec.pitch, spec.pitch_y, cand_id=spec.cand_id)
+        if use_point_load_support_layout:
+            pos_x0 = _positions_from_pitch(cfg, "X", spec.pitch)
+            pos_y0 = _positions_from_pitch(cfg, "Y", spec.pitch_y)
+            pos_x_sup, pos_y_sup = _apply_rule_support_min_length_xy(cfg, pos_x0, pos_y0)
+            sol = solve_layout_grid_positions(
+                cfg,
+                mat,
+                setts,
+                sections,
+                positions_x=pos_x_sup,
+                positions_y=pos_y_sup,
+                cand_id=spec.cand_id,
+                system="GRID_SUP",
+            )
+            sol = replace(
+                sol,
+                pitch=_calc_layout_pitch_from_positions(cfg, "X", pos_x_sup),
+                pitch_y=_calc_layout_pitch_from_positions(cfg, "Y", pos_y_sup),
+                system="GRID_SUP",
+            )
+        else:
+            sol = solve_layout_grid(cfg, mat, setts, sections, spec.pitch, spec.pitch_y, cand_id=spec.cand_id)
     elif spec.system == "ENUM_X":
         if spec.pos_x is None:
             raise ValueError(f"ENUM_X candidate requires pos_x: {spec}")
-        pos_x_ac = _apply_rule_ac_single_direction(cfg, "X", list(spec.pos_x))
-        sol = solve_layout_positions(
-            cfg,
-            mat,
-            setts,
-            sections,
-            direction="X",
-            positions=pos_x_ac,
-            cand_id=spec.cand_id,
-        )
-        sol = replace(
-            sol,
-            pitch=_calc_layout_pitch_from_positions(cfg, "X", pos_x_ac),
-            system="ENUM_X_AC",
-        )
+        pos_x_base = list(spec.pos_x)
+        pos_y_base: List[float] = []
+        pos_x = list(pos_x_base)
+        pos_y = list(pos_y_base)
+        if use_point_load_support_layout:
+            pos_x, pos_y = _apply_rule_support_min_length_xy(cfg, pos_x, pos_y)
+
+        # If support rule added Y-lines, this case becomes true XY and must be solved as grid.
+        needs_xy = use_point_load_support_layout and _has_added_positions(pos_y_base, pos_y)
+        if needs_xy:
+            sol = solve_layout_grid_positions(
+                cfg,
+                mat,
+                setts,
+                sections,
+                positions_x=pos_x,
+                positions_y=pos_y,
+                cand_id=spec.cand_id,
+                system="ENUM_X_SUP",
+            )
+            sol = replace(
+                sol,
+                pitch=_calc_layout_pitch_from_positions(cfg, "X", pos_x),
+                pitch_y=_calc_layout_pitch_from_positions(cfg, "Y", pos_y),
+                system="ENUM_X_SUP",
+            )
+        else:
+            sol = solve_layout_positions(
+                cfg,
+                mat,
+                setts,
+                sections,
+                direction="X",
+                positions=pos_x,
+                cand_id=spec.cand_id,
+            )
+            sol = replace(
+                sol,
+                pitch=_calc_layout_pitch_from_positions(cfg, "X", pos_x),
+                system=("ENUM_X_SUP" if use_point_load_support_layout else "ENUM_X"),
+            )
     elif spec.system == "ENUM_Y":
         if spec.pos_y is None:
             raise ValueError(f"ENUM_Y candidate requires pos_y: {spec}")
-        pos_y_ac = _apply_rule_ac_single_direction(cfg, "Y", list(spec.pos_y))
-        sol = solve_layout_positions(
-            cfg,
-            mat,
-            setts,
-            sections,
-            direction="Y",
-            positions=pos_y_ac,
-            cand_id=spec.cand_id,
-        )
-        sol = replace(
-            sol,
-            pitch=_calc_layout_pitch_from_positions(cfg, "Y", pos_y_ac),
-            system="ENUM_Y_AC",
-        )
+        pos_x_base: List[float] = []
+        pos_y_base = list(spec.pos_y)
+        pos_x = list(pos_x_base)
+        pos_y = list(pos_y_base)
+        if use_point_load_support_layout:
+            pos_x, pos_y = _apply_rule_support_min_length_xy(cfg, pos_x, pos_y)
+
+        # If support rule added X-lines, this case becomes true XY and must be solved as grid.
+        needs_xy = use_point_load_support_layout and _has_added_positions(pos_x_base, pos_x)
+        if needs_xy:
+            sol = solve_layout_grid_positions(
+                cfg,
+                mat,
+                setts,
+                sections,
+                positions_x=pos_x,
+                positions_y=pos_y,
+                cand_id=spec.cand_id,
+                system="ENUM_Y_SUP",
+            )
+            sol = replace(
+                sol,
+                pitch=_calc_layout_pitch_from_positions(cfg, "X", pos_x),
+                pitch_y=_calc_layout_pitch_from_positions(cfg, "Y", pos_y),
+                system="ENUM_Y_SUP",
+            )
+        else:
+            sol = solve_layout_positions(
+                cfg,
+                mat,
+                setts,
+                sections,
+                direction="Y",
+                positions=pos_y,
+                cand_id=spec.cand_id,
+            )
+            sol = replace(
+                sol,
+                pitch=_calc_layout_pitch_from_positions(cfg, "Y", pos_y),
+                system=("ENUM_Y_SUP" if use_point_load_support_layout else "ENUM_Y"),
+            )
     elif spec.system in ("GRID_LOAD", "GRID_ENUM"):
         if spec.pos_x is None or spec.pos_y is None:
             raise ValueError(f"{spec.system} candidate requires explicit positions: {spec}")
-        pos_x_ac, pos_y_ac = _apply_rule_ac_xy(cfg, list(spec.pos_x), list(spec.pos_y))
+        pos_x = list(spec.pos_x)
+        pos_y = list(spec.pos_y)
+        if use_point_load_support_layout:
+            pos_x, pos_y = _apply_rule_support_min_length_xy(cfg, pos_x, pos_y)
         sol = solve_layout_grid_positions(
             cfg,
             mat,
             setts,
             sections,
-            positions_x=pos_x_ac,
-            positions_y=pos_y_ac,
+            positions_x=pos_x,
+            positions_y=pos_y,
             cand_id=spec.cand_id,
-            system=(f"{spec.system}_AC" if spec.system == "GRID_ENUM" else spec.system),
+            system=(f"{spec.system}_SUP" if use_point_load_support_layout and spec.system == "GRID_ENUM" else spec.system),
         )
         if spec.pitch_y is not None:
             sol = replace(
                 sol,
-                pitch=_calc_layout_pitch_from_positions(cfg, "X", pos_x_ac),
-                pitch_y=_calc_layout_pitch_from_positions(cfg, "Y", pos_y_ac),
-                system=(f"{spec.system}_AC" if spec.system == "GRID_ENUM" else spec.system),
+                pitch=_calc_layout_pitch_from_positions(cfg, "X", pos_x),
+                pitch_y=_calc_layout_pitch_from_positions(cfg, "Y", pos_y),
+                system=(f"{spec.system}_SUP" if use_point_load_support_layout and spec.system == "GRID_ENUM" else spec.system),
             )
     elif spec.system == "FREE":
         if spec.pitch_y is None:
             raise ValueError(f"FREE candidate requires pitch_y seed: {spec}")
         sol = solve_layout_grid_free(cfg, mat, setts, sections, spec.pitch, spec.pitch_y, cand_id=spec.cand_id)
     else:
-        sol = solve_layout(cfg, mat, setts, sections, spec.direction, spec.pitch, cand_id=spec.cand_id)
+        if use_point_load_support_layout and spec.system == "SINGLE" and spec.direction in ("X", "Y"):
+            if spec.direction == "X":
+                pos_x_base = _positions_from_pitch(cfg, "X", spec.pitch)
+                pos_y_base: List[float] = []
+            else:
+                pos_x_base = []
+                pos_y_base = _positions_from_pitch(cfg, "Y", spec.pitch)
+
+            pos_x = list(pos_x_base)
+            pos_y = list(pos_y_base)
+            pos_x, pos_y = _apply_rule_support_min_length_xy(cfg, pos_x, pos_y)
+
+            opp_added = (
+                _has_added_positions(pos_y_base, pos_y)
+                if spec.direction == "X"
+                else _has_added_positions(pos_x_base, pos_x)
+            )
+
+            if not opp_added:
+                dir_pos = pos_x if spec.direction == "X" else pos_y
+                sol = solve_layout_positions(
+                    cfg,
+                    mat,
+                    setts,
+                    sections,
+                    direction=spec.direction,
+                    positions=dir_pos,
+                    cand_id=spec.cand_id,
+                )
+                sol = replace(
+                    sol,
+                    pitch=_calc_layout_pitch_from_positions(cfg, spec.direction, dir_pos),
+                    system="SINGLE_SUP",
+                )
+            else:
+                sol = solve_layout_grid_positions(
+                    cfg,
+                    mat,
+                    setts,
+                    sections,
+                    positions_x=pos_x,
+                    positions_y=pos_y,
+                    cand_id=spec.cand_id,
+                    system="SINGLE_SUP",
+                )
+                sol = replace(
+                    sol,
+                    pitch=_calc_layout_pitch_from_positions(cfg, "X", pos_x),
+                    pitch_y=_calc_layout_pitch_from_positions(cfg, "Y", pos_y),
+                    system="SINGLE_SUP",
+                )
+        else:
+            sol = solve_layout(cfg, mat, setts, sections, spec.direction, spec.pitch, cand_id=spec.cand_id)
 
     n_main = len([m for m in sol.member_checks if m.member_type == "MAIN"])
     n_trans = len([m for m in sol.member_checks if m.member_type == "TRANS"])
@@ -3111,10 +4125,17 @@ def _worker_eval(args) -> WorkerResult:
         ng_reason=sol.ng_reason,
         pitch_y=sol.pitch_y,
         system=sol.system,
+        case_scope=spec.case_scope,
+        raw_case_no=spec.raw_case_no,
+        dedup_case_no=spec.dedup_case_no,
+        mapped_dedup_case_no=spec.mapped_dedup_case_no,
+        dedup_group_key=spec.dedup_group_key,
+        raw_case_members=spec.raw_case_members,
     )
 
     return WorkerResult(
         cand_no=spec.cand_no,
+        worker_pid=worker_pid,
         spec=spec,
         row=row,
         sol=sol,
@@ -3124,6 +4145,7 @@ def _worker_eval(args) -> WorkerResult:
         dbg_trans_defs=list(_DBG_TRANS_DEFS),
         dbg_member_final=list(_DBG_MEMBER_FINAL),
         dbg_alloc_final=list(_DBG_ALLOC_FINAL),
+        dbg_step_member_loads=list(_DBG_STEP_MEMBER_LOADS),
     )
 
 
@@ -3149,12 +4171,18 @@ def parallel_stage(
     total = len(tasks)
 
     with ProcessPoolExecutor(max_workers=max_workers) as ex:
-        futs = [ex.submit(_worker_eval, t) for t in tasks]
-        for fut in as_completed(futs):
-            results.append(fut.result())
+        fut_to_spec = {ex.submit(_worker_eval, t): t[4] for t in tasks}
+        for fut in as_completed(fut_to_spec):
+            spec = fut_to_spec[fut]
+            try:
+                wr = fut.result()
+            except Exception as e:
+                cand_id = spec.cand_id if spec and spec.cand_id else "UNKNOWN"
+                print(f"[Progress] FAILED case={cand_id} error={type(e).__name__}: {e}")
+                raise
+            results.append(wr)
             done += 1
-            if done % max(1, total // 20) == 0 or done == total:
-                print(f"[Progress] {done}/{total} evaluated")
+            print(f"[Progress] {done}/{total} evaluated case={wr.spec.cand_id} pid={wr.worker_pid}")
 
     results.sort(key=lambda x: x.cand_no)
     return results
@@ -3171,6 +4199,7 @@ def postprocess_stage(worker_results: List[WorkerResult]) -> Tuple[List[Candidat
         _DBG_TRANS_DEFS.extend(wr.dbg_trans_defs)
         _DBG_MEMBER_FINAL.extend(wr.dbg_member_final)
         _DBG_ALLOC_FINAL.extend(wr.dbg_alloc_final)
+        _DBG_STEP_MEMBER_LOADS.extend(wr.dbg_step_member_loads)
 
     for i, e in enumerate(merged_trace, start=1):
         e["seq"] = i
@@ -3207,12 +4236,183 @@ def output_stage(
     write_result_xlsx(in_path, out_path, cfg, mat, setts, sections, cand_rows, best)
 
 
-def write_all_cases_pdf(cfg: Config, worker_results: List[WorkerResult], pdf_path: str) -> bool:
+@dataclass(frozen=True)
+class _RenderCase:
+    case_no: int
+    case_id: str
+    scope: str  # "RAW" / "DEDUP" / "DIRECT"
+    mapped_dedup_case_no: Optional[int]
+    spec: CandidateSpec
+    sol: Solution
+
+
+def _build_render_cases(
+    cfg: Config,
+    worker_results: List[WorkerResult],
+) -> Tuple[List[_RenderCase], List[_RenderCase]]:
+    """
+    Build case views for:
+      - raw all-branch enumeration (with dedup result mapping)
+      - deduplicated/evaluated cases
+    """
+    if not worker_results:
+        return [], []
+
+    results_sorted = sorted(worker_results, key=lambda wr: wr.cand_no)
+    dedup_map: Dict[int, WorkerResult] = {}
+    direct_results: List[WorkerResult] = []
+
+    for wr in results_sorted:
+        dno = wr.spec.dedup_case_no
+        if dno is None:
+            direct_results.append(wr)
+            continue
+        # keep earliest candidate if duplicated unexpectedly
+        if dno not in dedup_map:
+            dedup_map[dno] = wr
+
+    bundle = _enumerate_xy_layout_bundle(cfg)
+    has_enum_bundle = (len(bundle.dedup_cases) > 0 and len(bundle.raw_cases) > 0 and len(dedup_map) > 0)
+
+    if not has_enum_bundle:
+        direct_cases: List[_RenderCase] = []
+        for i, wr in enumerate(results_sorted, start=1):
+            direct_cases.append(_RenderCase(
+                case_no=i,
+                case_id=wr.spec.cand_id if wr.spec.cand_id else f"C{i:03d}",
+                scope="DIRECT",
+                mapped_dedup_case_no=None,
+                spec=wr.spec,
+                sol=wr.sol,
+            ))
+        return direct_cases, direct_cases
+
+    dedup_cases: List[_RenderCase] = []
+    dno_page = 0
+    for didx0, case in enumerate(bundle.dedup_cases):
+        dedup_no = didx0 + 1
+        wr = dedup_map.get(dedup_no)
+        if wr is None:
+            continue
+        dno_page += 1
+        spec_v = replace(
+            wr.spec,
+            pos_x=case.pos_x,
+            pos_y=case.pos_y,
+            enum_decisions=case.decisions,
+            enum_segments=case.segments,
+            case_scope="DEDUP",
+            dedup_case_no=dedup_no,
+            mapped_dedup_case_no=dedup_no,
+            dedup_group_key=(wr.spec.dedup_group_key or f"G{dedup_no:03d}"),
+        )
+        dedup_cases.append(_RenderCase(
+            case_no=dno_page,
+            case_id=f"D{dedup_no:03d}",
+            scope="DEDUP",
+            mapped_dedup_case_no=dedup_no,
+            spec=spec_v,
+            sol=wr.sol,
+        ))
+
+    for wr in direct_results:
+        dno_page += 1
+        dedup_cases.append(_RenderCase(
+            case_no=dno_page,
+            case_id=wr.spec.cand_id if wr.spec.cand_id else f"C{wr.cand_no:03d}",
+            scope="DIRECT",
+            mapped_dedup_case_no=None,
+            spec=wr.spec,
+            sol=wr.sol,
+        ))
+
+    raw_cases: List[_RenderCase] = []
+    rno_page = 0
+    for ridx0, case in enumerate(bundle.raw_cases):
+        raw_no = ridx0 + 1
+        dedup_no = int(bundle.raw_to_dedup[ridx0]) + 1
+        wr = dedup_map.get(dedup_no)
+        if wr is None:
+            continue
+        rno_page += 1
+        spec_v = replace(
+            wr.spec,
+            pos_x=case.pos_x,
+            pos_y=case.pos_y,
+            enum_decisions=case.decisions,
+            enum_segments=case.segments,
+            case_scope="RAW",
+            raw_case_no=raw_no,
+            dedup_case_no=dedup_no,
+            mapped_dedup_case_no=dedup_no,
+            dedup_group_key=(wr.spec.dedup_group_key or f"G{dedup_no:03d}"),
+        )
+        raw_cases.append(_RenderCase(
+            case_no=rno_page,
+            case_id=f"R{raw_no:03d}",
+            scope="RAW",
+            mapped_dedup_case_no=dedup_no,
+            spec=spec_v,
+            sol=wr.sol,
+        ))
+
+    for wr in direct_results:
+        rno_page += 1
+        raw_cases.append(_RenderCase(
+            case_no=rno_page,
+            case_id=wr.spec.cand_id if wr.spec.cand_id else f"C{wr.cand_no:03d}",
+            scope="DIRECT",
+            mapped_dedup_case_no=None,
+            spec=wr.spec,
+            sol=wr.sol,
+        ))
+
+    return raw_cases, dedup_cases
+
+
+def write_case_list_txt(path: str, cases: List[_RenderCase]) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(f"Total cases: {len(cases)}\n")
+        f.write(
+            "CaseNo\tCaseID\tScope\tMappedDedup\tSystem\tDir\tPitchX\tPitchY\tDecisions\t"
+            "RawCaseNo\tDedupCaseNo\tDedupGroup\tOK/NG\n"
+        )
+        for c in sorted(cases, key=lambda x: x.case_no):
+            spec = c.spec
+            sol = c.sol
+            dec = " -> ".join([f"{m}:{k}" for m, k in (spec.enum_decisions or tuple())])
+            ptx = f"{sol.pitch:.6g}" if math.isfinite(sol.pitch) else ""
+            pty = ""
+            if sol.pitch_y is not None and math.isfinite(float(sol.pitch_y)):
+                pty = f"{float(sol.pitch_y):.6g}"
+            mdc = "" if c.mapped_dedup_case_no is None else str(c.mapped_dedup_case_no)
+            rc = "" if spec.raw_case_no is None else str(spec.raw_case_no)
+            dc = "" if spec.dedup_case_no is None else str(spec.dedup_case_no)
+            ok_txt = "OK" if sol.ok else f"NG: {sol.ng_reason}"
+            f.write(
+                f"{c.case_no:03d}\t{c.case_id}\t{c.scope}\t{mdc}\t{sol.system}\t{sol.direction}\t"
+                f"{ptx}\t{pty}\t{dec}\t{rc}\t{dc}\t{spec.dedup_group_key}\t{ok_txt}\n"
+            )
+
+
+def write_all_cases_pdf(
+    cfg: Config,
+    worker_results: List[WorkerResult],
+    pdf_path: str,
+    scope: str = "DEDUP",
+    prebuilt_cases: Optional[List[_RenderCase]] = None,
+    collect_debug: bool = True,
+) -> bool:
     """
     Write one-page-per-case beam layout PDF.
     Returns True when PDF was generated, False when skipped (e.g., reportlab missing).
     """
-    if not worker_results:
+    if prebuilt_cases is not None:
+        render_cases = sorted(prebuilt_cases, key=lambda c: c.case_no)
+    else:
+        raw_cases, dedup_cases = _build_render_cases(cfg, worker_results)
+        render_cases = raw_cases if str(scope).upper() == "RAW" else dedup_cases
+    if not render_cases:
         return False
 
     try:
@@ -3243,6 +4443,72 @@ def write_all_cases_pdf(cfg: Config, worker_results: List[WorkerResult], pdf_pat
             return f"X={sol.pitch:g}, Y={sol.pitch_y:g}"
         return f"{sol.pitch:g}"
 
+    def _cut_points(vals: List[float], lo: float, hi: float, eps: float = 1e-9) -> List[float]:
+        out = [float(lo), float(hi)]
+        for v in vals:
+            vv = min(max(float(v), float(lo)), float(hi))
+            out.append(vv)
+        out = sorted(out)
+        uniq: List[float] = []
+        for v in out:
+            if not uniq or abs(v - uniq[-1]) > eps:
+                uniq.append(v)
+        if len(uniq) < 2:
+            return [float(lo), float(hi)]
+        return uniq
+
+    def _split_ac_lines(
+        base_segs: List[Tuple[str, int, str, float, float, float, float, float]],
+        ac_lines: List[Tuple[str, float]],
+        step: int,
+    ) -> List[Tuple[str, int, str, float, float, float, float, float]]:
+        eps = 1e-9
+        out: List[Tuple[str, int, str, float, float, float, float, float]] = []
+        aid = 1
+        ac_norm = sorted(set((str(t), round(float(c), 10)) for t, c in ac_lines))
+        for typ, const in ac_norm:
+            if typ == "X":
+                cuts_x: List[float] = [0.0, float(cfg.Lx)]
+                # split by existing vertical segments
+                for _sid, _st, btyp, _bc, x0, y0, x1, y1 in base_segs:
+                    if btyp != "Y":
+                        continue
+                    ylo = min(y0, y1) - eps
+                    yhi = max(y0, y1) + eps
+                    if ylo <= const <= yhi:
+                        cuts_x.append(float(x0))
+                # split by other A/C vertical lines
+                for at, ac in ac_norm:
+                    if at == "Y":
+                        cuts_x.append(float(ac))
+                xs = _cut_points(cuts_x, 0.0, float(cfg.Lx), eps=eps)
+                for a, b in zip(xs[:-1], xs[1:]):
+                    if b - a <= eps:
+                        continue
+                    out.append((f"A{aid}", int(step), "X", float(const), float(a), float(const), float(b), float(const)))
+                    aid += 1
+            else:
+                cuts_y: List[float] = [0.0, float(cfg.Ly)]
+                # split by existing horizontal segments
+                for _sid, _st, btyp, _bc, x0, y0, x1, y1 in base_segs:
+                    if btyp != "X":
+                        continue
+                    xlo = min(x0, x1) - eps
+                    xhi = max(x0, x1) + eps
+                    if xlo <= const <= xhi:
+                        cuts_y.append(float(y0))
+                # split by other A/C horizontal lines
+                for at, ac in ac_norm:
+                    if at == "X":
+                        cuts_y.append(float(ac))
+                ys = _cut_points(cuts_y, 0.0, float(cfg.Ly), eps=eps)
+                for a, b in zip(ys[:-1], ys[1:]):
+                    if b - a <= eps:
+                        continue
+                    out.append((f"A{aid}", int(step), "Y", float(const), float(const), float(a), float(const), float(b)))
+                    aid += 1
+        return out
+
     def _draw_pin(cvs, x: float, y: float, x2: float, y2: float, inset: float, r: float) -> None:
         dx = x2 - x
         dy = y2 - y
@@ -3255,8 +4521,30 @@ def write_all_cases_pdf(cfg: Config, worker_results: List[WorkerResult], pdf_pat
         py = y + uy * inset
         cvs.circle(px, py, r, stroke=1, fill=0)
 
-    def _segments_for_case(wr: WorkerResult) -> Tuple[List[Tuple[str, int, str, float, float, float, float, float]], str]:
-        spec = wr.spec
+    def _initial_positions_for_case(spec: CandidateSpec) -> Tuple[List[float], List[float], bool]:
+        pos_x: List[float] = list(spec.pos_x) if spec.pos_x is not None else []
+        pos_y: List[float] = list(spec.pos_y) if spec.pos_y is not None else []
+        resolved = (spec.pos_x is not None) or (spec.pos_y is not None)
+
+        if not resolved:
+            if spec.system == "SINGLE" and spec.direction == "X":
+                pos_x = _positions_from_pitch(cfg, "X", spec.pitch)
+                resolved = True
+            elif spec.system == "SINGLE" and spec.direction == "Y":
+                pos_y = _positions_from_pitch(cfg, "Y", spec.pitch)
+                resolved = True
+            elif spec.system == "GRID" and spec.pitch_y is not None:
+                pos_x = _positions_from_pitch(cfg, "X", spec.pitch)
+                pos_y = _positions_from_pitch(cfg, "Y", spec.pitch_y)
+                resolved = True
+
+        return (
+            _sanitize_positions_for_direction(cfg, "X", pos_x),
+            _sanitize_positions_for_direction(cfg, "Y", pos_y),
+            resolved,
+        )
+
+    def _segments_for_case(spec: CandidateSpec, sol: Solution) -> Tuple[List[Tuple[str, int, str, float, float, float, float, float]], str]:
         segs: List[Tuple[str, int, str, float, float, float, float, float]] = []
         max_step = 1
         if spec.enum_segments:
@@ -3275,23 +4563,72 @@ def write_all_cases_pdf(cfg: Config, worker_results: List[WorkerResult], pdf_pat
                     float(s.y1),
                 ))
 
-            # Add A/C-adjusted beam lines (not present in raw enum segments) as a final step.
+            # Add A/C-adjusted beam lines (not present in raw enum segments) as step Smax+1.
+            # These lines are split at intersections so each span is represented as a member segment.
             existing_lines = {(typ, const) for _, _, typ, const, *_ in segs}
-            ac_no = 1
-            for b in sorted(wr.sol.main_geoms, key=lambda g: (g.direction, g.pos, g.beam_id)):
-                typ = str(b.direction)
-                const = round(float(b.pos), 10)
-                key = (typ, const)
-                if key in existing_lines:
-                    continue
-                existing_lines.add(key)
-                if typ == "X":
-                    segs.append((f"A{ac_no}", max_step + 1, "X", const, 0.0, const, float(cfg.Lx), const))
-                else:
-                    segs.append((f"A{ac_no}", max_step + 1, "Y", const, const, 0.0, const, float(cfg.Ly)))
-                ac_no += 1
+            ac_lines: List[Tuple[str, float]] = []
+            uncovered_loads: List[PointLoad] = []
+            pos_x0, pos_y0, resolved = _initial_positions_for_case(spec)
+            if resolved and cfg.loads:
+                tol_load = max(cfg.snap_tol, 1e-6)
+                for pl in cfg.loads:
+                    on_x0 = _is_on_beam_line(float(pl.y), pos_x0, tol_load)
+                    on_y0 = _is_on_beam_line(float(pl.x), pos_y0, tol_load)
+                    if not (on_x0 or on_y0):
+                        uncovered_loads.append(pl)
+
+                pos_x_sup, pos_y_sup = _apply_rule_support_min_length_xy(cfg, pos_x0, pos_y0)
+                for y_const in pos_x_sup:
+                    key = ("X", round(float(y_const), 10))
+                    if key in existing_lines:
+                        continue
+                    existing_lines.add(key)
+                    ac_lines.append(("X", float(y_const)))
+                for x_const in pos_y_sup:
+                    key = ("Y", round(float(x_const), 10))
+                    if key in existing_lines:
+                        continue
+                    existing_lines.add(key)
+                    ac_lines.append(("Y", float(x_const)))
+            elif not resolved:
+                for b in sorted(sol.main_geoms, key=lambda g: (g.direction, g.pos, g.beam_id)):
+                    typ = str(b.direction)
+                    const = round(float(b.pos), 10)
+                    key = (typ, const)
+                    if key in existing_lines:
+                        continue
+                    existing_lines.add(key)
+                    ac_lines.append((typ, const))
+            if ac_lines:
+                ac_segs = _split_ac_lines(segs, ac_lines, max_step + 1)
+
+                # Keep only concentrated-load support segments that actually contain a point load.
+                # This removes unnecessary spans on the same support line where no concentrated load exists.
+                tol = max(cfg.snap_tol, 1e-6)
+                target_loads = uncovered_loads if uncovered_loads else list(cfg.loads)
+                ac_kept: List[Tuple[str, int, str, float, float, float, float, float]] = []
+                for _sid, st, typ, const, x0, y0, x1, y1 in ac_segs:
+                    has_load = False
+                    if typ == "X":
+                        lo, hi = sorted((float(x0), float(x1)))
+                        for pl in target_loads:
+                            if abs(float(pl.y) - float(const)) <= tol and (lo - tol) <= float(pl.x) <= (hi + tol):
+                                has_load = True
+                                break
+                    else:
+                        lo, hi = sorted((float(y0), float(y1)))
+                        for pl in target_loads:
+                            if abs(float(pl.x) - float(const)) <= tol and (lo - tol) <= float(pl.y) <= (hi + tol):
+                                has_load = True
+                                break
+                    if has_load:
+                        ac_kept.append(("", int(st), typ, float(const), float(x0), float(y0), float(x1), float(y1)))
+
+                # Renumber A IDs after filtering so IDs stay contiguous in table/diagram.
+                for aid, (_sid, st, typ, const, x0, y0, x1, y1) in enumerate(ac_kept, start=1):
+                    segs.append((f"A{aid}", st, typ, const, x0, y0, x1, y1))
         else:
-            for i, b in enumerate(sorted(wr.sol.main_geoms, key=lambda g: (g.direction, g.pos, g.beam_id)), start=1):
+            for i, b in enumerate(sorted(sol.main_geoms, key=lambda g: (g.direction, g.pos, g.beam_id)), start=1):
                 const = round(float(b.pos), 10)
                 if b.direction == "X":
                     segs.append((f"B{i}", 1, "X", const, 0.0, const, float(cfg.Lx), const))
@@ -3302,8 +4639,101 @@ def write_all_cases_pdf(cfg: Config, worker_results: List[WorkerResult], pdf_pat
         dec_str = " -> ".join([f"{m}:{k}" for m, k in dec]) if dec else "(n/a)"
         return segs, dec_str
 
-    results = sorted(worker_results, key=lambda wr: wr.cand_no)
-    total = len(results)
+    def _build_design_segments(sol: Solution) -> List[Tuple[str, float, float, float, int, str, str, str]]:
+        """
+        Build designed member segments:
+          (typ, const, a0, a1, rank, sec_name, beam_id, member_type)
+        where a0/a1 are along span axis:
+          - typ X => x-range
+          - typ Y => y-range
+        """
+        out: List[Tuple[str, float, float, float, int, str, str, str]] = []
+        for mc in sol.member_checks:
+            typ = str(mc.direction)
+            if typ not in ("X", "Y"):
+                continue
+
+            const_v = mc.pos_or_fixed
+            if const_v is None:
+                continue
+            const = round(float(const_v), 10)
+
+            if mc.left is not None and mc.right is not None:
+                a0 = float(min(mc.left, mc.right))
+                a1 = float(max(mc.left, mc.right))
+            elif str(mc.member_type).upper() == "MAIN":
+                if typ == "X":
+                    a0, a1 = 0.0, float(cfg.Lx)
+                else:
+                    a0, a1 = 0.0, float(cfg.Ly)
+            elif str(mc.member_type).upper() == "TRANS":
+                continue
+            else:
+                continue
+
+            if a1 - a0 <= 1e-9:
+                continue
+            out.append((
+                typ,
+                const,
+                a0,
+                a1,
+                int(mc.section_rank),
+                str(mc.section_name),
+                str(mc.beam_id),
+                str(mc.member_type),
+            ))
+        return out
+
+    def _resolve_seg_section(
+        seg: Tuple[str, int, str, float, float, float, float, float],
+        design_segs: List[Tuple[str, float, float, float, int, str, str, str]],
+        sol_ok: bool,
+        tol_const: float = 1e-6,
+    ) -> Tuple[str, str, str, int]:
+        seg_id, _step, typ, const, x0, y0, x1, y1 = seg
+        if typ == "X":
+            s0, s1 = sorted((float(x0), float(x1)))
+        else:
+            s0, s1 = sorted((float(y0), float(y1)))
+
+        matched_by_id: List[Tuple[int, str, str, str]] = []
+        matched: List[Tuple[int, str, str, str]] = []
+        for d_typ, d_const, d0, d1, rank, sec_name, beam_id, member_type in design_segs:
+            if d_typ != typ:
+                continue
+            if abs(float(d_const) - float(const)) > tol_const:
+                continue
+            ov = min(s1, d1) - max(s0, d0)
+            if ov <= 1e-9:
+                continue
+            m = (int(rank), str(sec_name), str(beam_id), str(member_type))
+            matched.append(m)
+            if str(beam_id) == str(seg_id):
+                matched_by_id.append(m)
+
+        if matched_by_id:
+            uniq_id = {(r, s) for r, s, _bid, _mt in matched_by_id}
+            if len(uniq_id) == 1:
+                rank, sec = sorted(uniq_id, key=lambda t: (t[0], t[1]))[0]
+                status = "OK_BY_ID" if len(matched_by_id) == 1 else "OK_BY_ID_MULTI"
+                return str(rank), str(sec), status, len(matched_by_id)
+            return "MIX", "MULTI", "MULTI_BY_ID", len(matched_by_id)
+
+        if not matched:
+            if sol_ok:
+                return "UNMAPPED", "UNMAPPED", "UNMAPPED", 0
+            return "-", "NoDesign", "NO_DESIGN", 0
+
+        uniq = {(r, s) for r, s, _bid, _mt in matched}
+        if len(uniq) == 1:
+            rank, sec = sorted(uniq, key=lambda t: (t[0], t[1]))[0]
+            status = "OK_SINGLE" if len(matched) == 1 else "OK_SAME_MULTI"
+            return str(rank), str(sec), status, len(matched)
+
+        return "MIX", "MULTI", "MULTI", len(matched)
+
+    total = len(render_cases)
     c = canvas.Canvas(pdf_path, pagesize=landscape(A4))
     W, H = landscape(A4)
 
@@ -3317,12 +4747,13 @@ def write_all_cases_pdf(cfg: Config, worker_results: List[WorkerResult], pdf_pat
     table_x = margin + diagram_w + gap
     table_y = margin + footer_h
 
-    for i, wr in enumerate(results, start=1):
-        sol = wr.sol
-        cand_id = wr.spec.cand_id if wr.spec.cand_id else f"C{wr.cand_no:03d}"
-        segs, dec_str = _segments_for_case(wr)
+    for i, rc in enumerate(render_cases, start=1):
+        sol = rc.sol
+        spec = rc.spec
+        segs, dec_str = _segments_for_case(spec, sol)
+        design_segs = _build_design_segments(sol)
 
-        title = f"Beam layout enumeration  Case {wr.cand_no}/{total}  [{cand_id}]"
+        title = f"Beam layout enumeration ({rc.scope})  Case {rc.case_no}/{total}  [{rc.case_id}]"
         c.setFont("Helvetica-Bold", 13)
         c.setFillColor(colors.black)
         c.drawString(margin, H - margin - 14, title)
@@ -3333,7 +4764,10 @@ def write_all_cases_pdf(cfg: Config, worker_results: List[WorkerResult], pdf_pat
             H - margin - 28,
             f"Span: {cfg.Lx:.2f}m (X) x {cfg.Ly:.2f}m (Y)   Stop: short side <= {cfg.short_pitch_limit:.2f}m",
         )
-        c.drawString(margin, H - margin - 40, f"Step decisions: {dec_str}")
+        map_txt = ""
+        if rc.mapped_dedup_case_no is not None and rc.scope == "RAW":
+            map_txt = f"   mapped dedup: D{rc.mapped_dedup_case_no:03d}"
+        c.drawString(margin, H - margin - 40, f"Step decisions: {dec_str}{map_txt}")
         c.drawString(
             margin,
             H - margin - 52,
@@ -3425,7 +4859,29 @@ def write_all_cases_pdf(cfg: Config, worker_results: List[WorkerResult], pdf_pat
             return (int(seg[1]), num, sid)
 
         segs_sorted = sorted(segs, key=_seg_sort_key)
-        for seg_id, step, typ, const, x0m, y0m, x1m, y1m in segs_sorted:
+        segs_resolved: List[Tuple[Tuple[str, int, str, float, float, float, float, float], str, str, str, int]] = []
+        for seg in segs_sorted:
+            rank_txt, sec_name, status, match_count = _resolve_seg_section(seg, design_segs, sol.ok)
+            segs_resolved.append((seg, rank_txt, sec_name, status, match_count))
+            if collect_debug:
+                seg_id, step, typ, const, x0m, y0m, x1m, y1m = seg
+                _dbg_add_pdf_section_map(
+                    case_id=rc.case_id,
+                    scope=rc.scope,
+                    seg_id=str(seg_id),
+                    step=int(step),
+                    typ=str(typ),
+                    const=float(const),
+                    x0=float(x0m),
+                    y0=float(y0m),
+                    x1=float(x1m),
+                    y1=float(y1m),
+                    match_count=int(match_count),
+                    chosen_rank=str(rank_txt),
+                    chosen_section=str(sec_name),
+                    status=str(status),
+                )
+        for (seg_id, step, typ, const, x0m, y0m, x1m, y1m), _rank_txt, _sec_name, _status, _match_count in segs_resolved:
             col = step_colors[(step - 1) % len(step_colors)]
             c.setStrokeColor(col)
             c.setFillColor(col)
@@ -3468,30 +4924,108 @@ def write_all_cases_pdf(cfg: Config, worker_results: List[WorkerResult], pdf_pat
         c.drawString(table_x, y, f"Segments={len(segs_sorted)}, Steps={beams_steps}")
         y -= 10
         c.drawString(table_x, y, f"Worst member={sol.worst_member_id or '-'}")
+        if not sol.member_checks:
+            y -= 10
+            c.drawString(table_x, y, "Section info: unavailable (NG case)")
         y -= 14
 
         c.setFont("Helvetica-Bold", 8)
         c.drawString(table_x, y, "Beam coordinate list (m)")
-        y -= 9
-        c.setFont("Helvetica-Bold", 7)
-        c.drawString(table_x, y, "ID   Step Type Const    Start (x,y)        End (x,y)")
         y -= 8
-        c.setFont("Helvetica", 7)
 
-        max_rows = int(max(6, (y - (table_y + 8)) // 8))
-        for seg_id, step, typ, const, x0m, y0m, x1m, y1m in segs_sorted[:max_rows]:
-            txt = (
-                f"{seg_id:<4} {step:>4} {typ:^4} {const:>6.2f}   "
-                f"({x0m:>5.2f},{y0m:>5.2f})   ({x1m:>5.2f},{y1m:>5.2f})"
-            )
-            c.drawString(table_x, y, txt)
-            y -= 8
-        if len(segs_sorted) > max_rows:
-            c.drawString(table_x, y, f"... {len(segs_sorted) - max_rows} more beams omitted")
+        # Draw beam coordinate table with cell borders.
+        col_labels = ["ID", "Step", "Ty", "Const", "Rank", "Section", "Start (x,y)", "End (x,y)"]
+        # Keep total table width at 115mm while giving "Section" enough room.
+        col_widths = [8 * mm, 8 * mm, 7 * mm, 10 * mm, 8 * mm, 24 * mm, 25 * mm, 25 * mm]
+        header_h = 7.0
+        row_h = 7.0
+        tbl_top = y
+        tbl_bottom_limit = table_y + 8
+        available_h = max(0.0, tbl_top - tbl_bottom_limit)
+        max_body_rows = int((available_h - header_h) // row_h) if available_h > header_h else 0
+        max_body_rows = max(1, max_body_rows)
+
+        overflow = len(segs_sorted) > max_body_rows
+        display_rows = max_body_rows - 1 if overflow and max_body_rows > 1 else min(len(segs_sorted), max_body_rows)
+        display_rows = max(1, display_rows) if segs_sorted else 1
+        body_rows = display_rows + (1 if overflow else 0)
+
+        tbl_h = header_h + row_h * body_rows
+        tbl_bottom = tbl_top - tbl_h
+
+        xs = [table_x]
+        for wv in col_widths:
+            xs.append(xs[-1] + wv)
+
+        c.setStrokeColor(colors.black)
+        c.setLineWidth(0.5)
+        c.rect(table_x, tbl_bottom, table_w, tbl_h, stroke=1, fill=0)
+        for xv in xs[1:-1]:
+            c.line(xv, tbl_bottom, xv, tbl_top)
+
+        yh = tbl_top - header_h
+        c.line(table_x, yh, table_x + table_w, yh)
+        for rline in range(1, body_rows + 1):
+            yy = yh - rline * row_h
+            c.line(table_x, yy, table_x + table_w, yy)
+
+        c.setFont("Helvetica-Bold", 6)
+        for i_col, lbl in enumerate(col_labels):
+            cx = xs[i_col] + 1.5
+            cy = tbl_top - header_h + 1.5
+            c.drawString(cx, cy, lbl)
+
+        c.setFont("Helvetica", 6)
+
+        def _fit_text_to_cell(text: object, max_w: float, font_name: str = "Helvetica", font_size: float = 6) -> str:
+            s = str(text)
+            if max_w <= 0:
+                return ""
+            if stringWidth(s, font_name, font_size) <= max_w:
+                return s
+            suffix = "..."
+            sw = stringWidth(suffix, font_name, font_size)
+            if sw >= max_w:
+                return suffix
+            lo, hi = 0, len(s)
+            while lo < hi:
+                mid = (lo + hi + 1) // 2
+                cand = s[:mid] + suffix
+                if stringWidth(cand, font_name, font_size) <= max_w:
+                    lo = mid
+                else:
+                    hi = mid - 1
+            return s[:lo] + suffix
+
+        rows_to_show = segs_resolved[:display_rows]
+        for i_row, (seg_row, rank_txt, sec_name, _status, _match_count) in enumerate(rows_to_show):
+            seg_id, step, typ, const, x0m, y0m, x1m, y1m = seg_row
+            section_txt = _fit_text_to_cell(sec_name, col_widths[5] - 3.0)
+
+            row_vals = [
+                str(seg_id),
+                str(int(step)),
+                str(typ),
+                f"{float(const):.2f}",
+                rank_txt,
+                section_txt,
+                f"({float(x0m):.2f},{float(y0m):.2f})",
+                f"({float(x1m):.2f},{float(y1m):.2f})",
+            ]
+
+            cell_y = yh - (i_row + 1) * row_h + 1.5
+            for i_col, v in enumerate(row_vals):
+                c.drawString(xs[i_col] + 1.5, cell_y, v)
+
+        if overflow:
+            omitted = len(segs_sorted) - display_rows
+            cell_y = yh - (display_rows + 1) * row_h + 1.5
+            c.drawString(xs[0] + 1.5, cell_y, "...")
+            c.drawString(xs[6] + 1.5, cell_y, f"{omitted} more omitted")
 
         c.setFont("Helvetica", 7)
         c.setFillColor(colors.HexColor("#666666"))
-        c.drawString(margin, margin - 2 * mm, "Legend: line color=step (Smax+1 means A/C-adjusted line), end dots=pin markers, red dots=point loads")
+        c.drawString(margin, margin - 2 * mm, "Legend: line color=step (Smax+1 means concentrated-load support lines), end dots=pin markers, red dots=point loads")
 
         c.showPage()
 
@@ -3527,10 +5061,32 @@ def run(in_path: str, out_path: str, max_workers: Optional[int] = None) -> None:
         best_pitch_y=(best.pitch_y if best else None),
         best_system=(best.system if best else None),
     )
+    base = os.path.splitext(out_path)[0]
+    raw_cases, dedup_cases = _build_render_cases(cfg, worker_results)
+    _DBG_PDF_SECTION_MAP.clear()
+
+    # PDF outputs
+    pdf_dedup = base + "_beam_layouts_dedup.pdf"
+    pdf_raw = base + "_beam_layouts_raw.pdf"
+    pdf_compat = base + "_beam_layouts.pdf"  # backward-compatible alias to dedup view
+
+    if write_all_cases_pdf(cfg, worker_results, pdf_dedup, scope="DEDUP", prebuilt_cases=dedup_cases, collect_debug=True):
+        print(f"[PDF] Dedup layout cases written: {pdf_dedup}")
+    if write_all_cases_pdf(cfg, worker_results, pdf_raw, scope="RAW", prebuilt_cases=raw_cases, collect_debug=True):
+        print(f"[PDF] Raw layout cases written: {pdf_raw}")
+    if write_all_cases_pdf(cfg, worker_results, pdf_compat, scope="DEDUP", prebuilt_cases=dedup_cases, collect_debug=False):
+        print(f"[PDF] Compatibility layout cases written: {pdf_compat}")
+
+    # Case lists (raw + dedup)
+    case_list_raw = base + "_case_list_raw.txt"
+    case_list_dedup = base + "_case_list_dedup.txt"
+    write_case_list_txt(case_list_raw, raw_cases)
+    write_case_list_txt(case_list_dedup, dedup_cases)
+    print(f"[LIST] Raw case list written: {case_list_raw}")
+    print(f"[LIST] Dedup case list written: {case_list_dedup}")
+
+    # Write Excel after PDF generation so DEBUG_PDF_SECTION_MAP can be included.
     output_stage(in_path, out_path, cfg, mat, setts, sections2, cand_rows, best)
-    pdf_path = os.path.splitext(out_path)[0] + "_beam_layouts.pdf"
-    if write_all_cases_pdf(cfg, worker_results, pdf_path):
-        print(f"[PDF] All layout cases written: {pdf_path}")
 
 
 # -----------------------------
@@ -3604,7 +5160,7 @@ def find_value_right_of_label(
     value_offset: int = 1,
 ) -> object:
     """
-    行位置が変わっても読めるよう、ラベル文字列を正規表現で探索して右隣セルの値を返す。
+    Find a label cell by regex and return the value from a cell to its right.
     """
     rgx = re.compile(label_regex, flags=re.IGNORECASE)
     for r in range(1, search_rows + 1):
@@ -3635,7 +5191,7 @@ def find_table_header(
     search_cols: int = 60
 ) -> Optional[Tuple[int, Dict[str, int], Dict[str, int]]]:
     """
-    見出し行を探索して、必須列が揃う行を返す。
+    Find a header row that contains all required aliases.
     Returns: (header_row, col_map_canonical, row_map_normheader->col)
     """
     for r in range(1, search_rows + 1):
@@ -3694,14 +5250,23 @@ def read_point_loads_table(ws) -> List[PointLoad]:
     return loads
 
 
-def read_sections_table(ws) -> List[Section]:
-    hdr = find_table_header(ws, {
+def read_sections_table(
+    ws,
+    *,
+    source_sheet: str = "INPUT",
+    require_use_true: bool = False,
+) -> List[Section]:
+    req = {
         "rank": ["rank"],
         "name": ["sectionname", "section", "name"],
-        "wg": ["w_g", "wg"],
-    }, search_rows=700, search_cols=40)
+    }
+    if require_use_true:
+        req["use"] = ["use", "enabled", "enable", "adopt"]
+    hdr = find_table_header(ws, req, search_rows=700, search_cols=40)
     if hdr is None:
-        raise ValueError("Section Candidates table not found (need Rank, SectionName, w_g).")
+        if require_use_true:
+            raise ValueError('Sheet "SECTION_DB" must have headers: Use, Rank, SectionName.')
+        raise ValueError("Section Candidates table not found (need Rank, SectionName).")
     header_row, cols_req, row_map = hdr
 
     def col_of(*aliases: str) -> Optional[int]:
@@ -3710,72 +5275,276 @@ def read_sections_table(ws) -> List[Section]:
                 return row_map[a]
         return None
 
+    def header_text(col: Optional[int]) -> str:
+        if col is None:
+            return ""
+        v = ws.cell(row=header_row, column=col).value
+        return _norm(v)
+
+    def is_cm_unit(col: Optional[int], order: int) -> bool:
+        t = header_text(col)
+        return (f"cm{order}" in t) or (f"cm^{order}" in t)
+
+    def opt_float(row: int, col: Optional[int]) -> Optional[float]:
+        if col is None:
+            return None
+        v = ws.cell(row=row, column=col).value
+        if v is None or str(v).strip() == "":
+            return None
+        try:
+            return float(v)
+        except Exception as e:
+            raise ValueError(f"Invalid numeric value at {source_sheet}!R{row}C{col}: {v}") from e
+
     c_rank = cols_req["rank"]
     c_name = cols_req["name"]
-    c_wg = cols_req["wg"]
+    c_use = cols_req.get("use", None)
 
+    c_wg = col_of("w_g", "wg")
+    c_unit_mass = col_of("unitmass", "unitmasskgm", "masskgm", "kgm")
     c_h = col_of("h", "hmm")
     c_b = col_of("b", "bmm")
-    c_tw = col_of("tw", "twmm")
-    c_tf = col_of("tf", "tfmm")
-    c_A = col_of("a", "amm2")
-    c_Z = col_of("z", "zmm3")
-    c_I = col_of("i", "imm4")
-    c_Av = col_of("av", "avmm2")
+    c_tw = col_of("tw", "twmm", "t1", "t1mm")
+    c_tf = col_of("tf", "tfmm", "t2", "t2mm")
+    c_A = col_of("a", "amm2", "acm2")
+    c_Z = col_of("z", "zx", "zmm3", "zxmm3", "zcm3", "zxcm3")
+    c_I = col_of("i", "ix", "imm4", "ixmm4", "icm4", "ixcm4")
+    c_Av = col_of("av", "avmm2", "avcm2")
+
+    A_is_cm2 = is_cm_unit(c_A, 2)
+    Z_is_cm3 = is_cm_unit(c_Z, 3)
+    I_is_cm4 = is_cm_unit(c_I, 4)
+    Av_is_cm2 = is_cm_unit(c_Av, 2)
 
     sections: List[Section] = []
+    used_ranks: Dict[int, int] = {}
+    used_names: Dict[str, int] = {}
     r = header_row + 1
     while True:
         rk = ws.cell(row=r, column=c_rank).value
         nm = ws.cell(row=r, column=c_name).value
-        wg = ws.cell(row=r, column=c_wg).value
         if (rk is None or str(rk).strip() == "") and (nm is None or str(nm).strip() == ""):
             break
         if nm is None or str(nm).strip() == "":
-            raise ValueError(f"SectionName missing at row {r}")
-        if wg is None or str(wg).strip() == "":
-            raise ValueError(f"w_g missing at row {r}")
+            raise ValueError(f"SectionName missing at {source_sheet}!R{r}")
+        if rk is None or str(rk).strip() == "":
+            raise ValueError(f"Rank missing at {source_sheet}!R{r}")
         try:
             rank = int(float(rk))
         except Exception as e:
-            raise ValueError(f"Rank invalid at row {r}: {rk}") from e
+            raise ValueError(f"Rank invalid at {source_sheet}!R{r}: {rk}") from e
+        name = str(nm).strip()
 
-        def opt(col: Optional[int]) -> Optional[float]:
-            if col is None:
-                return None
-            v = ws.cell(row=r, column=col).value
-            if v is None or str(v).strip() == "":
-                return None
-            return float(v)
+        if require_use_true and c_use is not None:
+            use_val = ws.cell(row=r, column=c_use).value
+            if not _to_bool(use_val, False):
+                r += 1
+                continue
+
+        if rank in used_ranks:
+            raise ValueError(f"Duplicate Rank in {source_sheet}: {rank} at row {r} (first row {used_ranks[rank]})")
+        if name in used_names:
+            raise ValueError(f"Duplicate SectionName in {source_sheet}: {name} at row {r} (first row {used_names[name]})")
+        used_ranks[rank] = r
+        used_names[name] = r
+
+        h = opt_float(r, c_h)
+        b = opt_float(r, c_b)
+        tw = opt_float(r, c_tw)
+        tf = opt_float(r, c_tf)
+        A_mm2 = opt_float(r, c_A)
+        Z_mm3 = opt_float(r, c_Z)
+        I_mm4 = opt_float(r, c_I)
+        Av_mm2 = opt_float(r, c_Av)
+        unit_mass = opt_float(r, c_unit_mass)
+        wg = opt_float(r, c_wg)
+
+        if A_mm2 is not None and A_is_cm2:
+            A_mm2 *= 100.0
+        if Z_mm3 is not None and Z_is_cm3:
+            Z_mm3 *= 1000.0
+        if I_mm4 is not None and I_is_cm4:
+            I_mm4 *= 10000.0
+        if Av_mm2 is not None and Av_is_cm2:
+            Av_mm2 *= 100.0
+
+        dims_before = (h, b, tw, tf)
+        if any(v is None for v in (h, b, tw, tf)):
+            dims = parse_h_section_dims(name)
+            if dims:
+                h = float(h if h is not None else dims[0])
+                b = float(b if b is not None else dims[1])
+                tw = float(tw if tw is not None else dims[2])
+                tf = float(tf if tf is not None else dims[3])
+                if dims_before != (h, b, tw, tf):
+                    _add_input_warning(
+                        sheet=source_sheet,
+                        row=r,
+                        section=name,
+                        field="h/b/tw/tf",
+                        action="auto_fill",
+                        detail="filled missing dimensions from SectionName pattern",
+                    )
+
+        if all(v is not None for v in (h, b, tw, tf)):
+            A2, I2, Z2, Av2 = approx_h_section_props_mm(float(h), float(b), float(tw), float(tf))
+            if A_mm2 is None:
+                A_mm2 = A2
+                _add_input_warning(
+                    sheet=source_sheet,
+                    row=r,
+                    section=name,
+                    field="A_mm2",
+                    action="auto_fill",
+                    detail="filled from dimensions (approximation)",
+                    value=A_mm2,
+                )
+            if I_mm4 is None:
+                I_mm4 = I2
+                _add_input_warning(
+                    sheet=source_sheet,
+                    row=r,
+                    section=name,
+                    field="I_mm4",
+                    action="auto_fill",
+                    detail="filled from dimensions (approximation)",
+                    value=I_mm4,
+                )
+            if Z_mm3 is None:
+                Z_mm3 = Z2
+                _add_input_warning(
+                    sheet=source_sheet,
+                    row=r,
+                    section=name,
+                    field="Z_mm3",
+                    action="auto_fill",
+                    detail="filled from dimensions (approximation)",
+                    value=Z_mm3,
+                )
+            if Av_mm2 is None:
+                Av_mm2 = Av2
+                _add_input_warning(
+                    sheet=source_sheet,
+                    row=r,
+                    section=name,
+                    field="Av_mm2",
+                    action="auto_fill",
+                    detail="filled from dimensions (tw*(h-2*tf))",
+                    value=Av_mm2,
+                )
+
+        if wg is None:
+            if unit_mass is not None:
+                wg = float(unit_mass) * 9.80665 / 1000.0
+                _add_input_warning(
+                    sheet=source_sheet,
+                    row=r,
+                    section=name,
+                    field="w_g",
+                    action="auto_fill",
+                    detail="filled from UnitMass[kg/m] * 9.80665 / 1000",
+                    value=wg,
+                )
+            elif A_mm2 is not None:
+                wg = float(A_mm2) * 1e-6 * STEEL_UNIT_WEIGHT_KN_M3
+                _add_input_warning(
+                    sheet=source_sheet,
+                    row=r,
+                    section=name,
+                    field="w_g",
+                    action="auto_fill",
+                    detail=f"filled from A * steel unit weight ({STEEL_UNIT_WEIGHT_KN_M3} kN/m3)",
+                    value=wg,
+                )
+            else:
+                raise ValueError(
+                    f"w_g missing and cannot be reconstructed at {source_sheet}!R{r}: {name} "
+                    "(need UnitMass or A)"
+                )
+
+        if any(v is None for v in (A_mm2, Z_mm3, I_mm4, Av_mm2)):
+            raise ValueError(
+                f"Section properties incomplete at {source_sheet}!R{r}: {name} "
+                "(need A/Av/Z/I, or dimensions to reconstruct)"
+            )
 
         sections.append(Section(
             rank=rank,
-            name=str(nm).strip(),
+            name=name,
             w_g=float(wg),
-            h=opt(c_h),
-            b=opt(c_b),
-            tw=opt(c_tw),
-            tf=opt(c_tf),
-            A_mm2=opt(c_A),
-            Z_mm3=opt(c_Z),
-            I_mm4=opt(c_I),
-            Av_mm2=opt(c_Av),
+            h=h,
+            b=b,
+            tw=tw,
+            tf=tf,
+            A_mm2=A_mm2,
+            Z_mm3=Z_mm3,
+            I_mm4=I_mm4,
+            Av_mm2=Av_mm2,
         ))
         r += 1
 
     sections = sorted(sections, key=lambda s: s.rank)
     if not sections:
-        raise ValueError("No sections provided.")
+        raise ValueError(f"No sections provided in sheet {source_sheet}.")
+    if require_use_true:
+        ranks = [s.rank for s in sections]
+        expect = list(range(1, len(sections) + 1))
+        if ranks != expect:
+            raise ValueError(
+                f"SECTION_DB Rank must be contiguous 1..N for enabled rows. got={ranks[:10]}..."
+            )
     return sections
 
 
+def read_section_selection_names(ws) -> List[str]:
+    """
+    Read optional section-selection rows from INPUT sheet.
+    Expected header includes at least SectionName; optional Use column.
+    If table is missing or no rows are provided, returns [].
+    """
+    hdr = find_table_header(
+        ws,
+        {"name": ["sectionname", "section", "name"]},
+        search_rows=800,
+        search_cols=40,
+    )
+    if hdr is None:
+        return []
+    header_row, cols_req, row_map = hdr
+    c_name = cols_req["name"]
+    c_use = row_map.get("use", None)
+
+    out: List[str] = []
+    seen: Dict[str, int] = {}
+    r = header_row + 1
+    while True:
+        nm = ws.cell(row=r, column=c_name).value
+        if nm is None or str(nm).strip() == "":
+            break
+        if c_use is not None:
+            use_val = ws.cell(row=r, column=c_use).value
+            if not _to_bool(use_val, True):
+                r += 1
+                continue
+        name = str(nm).strip()
+        if name in seen:
+            raise ValueError(
+                f"Duplicate SectionName in INPUT selection: {name} at row {r} (first row {seen[name]})"
+            )
+        seen[name] = r
+        out.append(name)
+        r += 1
+    return out
+
+
 def read_input_xlsx(path: str) -> Tuple[Config, Material, SolverSettings, List[Section]]:
+    _clear_input_warnings()
     wb = load_workbook(path, data_only=True)
     if "INPUT" not in wb.sheetnames:
         raise ValueError('Sheet "INPUT" not found.')
     ws = wb["INPUT"]
 
-    # --- 基本寸法・荷重（ラベル検索） ---
+    # --- basic geometry and slab load ---
     Lx = float(find_value_right_of_label(ws, r"^\s*lx\b", required=True))
     Ly = float(find_value_right_of_label(ws, r"^\s*ly\b", required=True))
     q = float(find_value_right_of_label(ws, r"^\s*q\b", required=True))
@@ -3786,10 +5555,10 @@ def read_input_xlsx(path: str) -> Tuple[Config, Material, SolverSettings, List[S
     if load_share_model not in ("KAMEKKO", "ONEWAY"):
         load_share_model = "KAMEKKO"
 
-    # --- 点荷重（テーブル探索） ---
+    # --- point loads table ---
     loads = read_point_loads_table(ws)
 
-    # --- レイアウト候補 ---
+    # --- layout options ---
     enable_x = _to_bool(find_value_right_of_label(ws, r"enable\s*x", default=True), True)
     enable_y = _to_bool(find_value_right_of_label(ws, r"enable\s*y", default=True), True)
     grid_default = bool(enable_x and enable_y)
@@ -3812,7 +5581,7 @@ def read_input_xlsx(path: str) -> Tuple[Config, Material, SolverSettings, List[S
     pitch_step = float(find_value_right_of_label(ws, r"pitch\s*step", default=0.5))
     short_pitch_limit = float(find_value_right_of_label(ws, r"short-?side.*pitch.*limit", default=3.0))
 
-    # 任意：ピッチ候補リスト（見出し "Pitch [m]" を探索）
+    # explicit pitch list table (header: "Pitch [m]"), optional
     pitch_list: List[float] = []
     pitch_hdr = find_cell(ws, r"^\s*pitch\s*\[m\]\s*$", search_rows=500, search_cols=30)
     if pitch_hdr is not None:
@@ -3836,12 +5605,12 @@ def read_input_xlsx(path: str) -> Tuple[Config, Material, SolverSettings, List[S
                     pitch_list.append(float(v))
                     rr += 1
 
-    # 任意：snap tolerance（無ければ 1e-3 m）
+    # snap tolerance (if empty, default to 1e-3 m)
     snap_raw = find_value_right_of_label(ws, r"snap.*tol", default=None)
     snap_tol = 1e-3 if (snap_raw is None or str(snap_raw).strip() == "") else float(snap_raw)
     snap_tol = max(float(snap_tol), 1e-6)
 
-    # --- 材料・許容 ---
+    # --- material properties ---
     E_val = float(find_value_right_of_label(ws, r"^\s*e\s*$", default=205000.0))
     e_cell = find_cell(ws, r"^\s*e\s*$", search_rows=400, search_cols=8)
     E_unit = ws.cell(row=e_cell[0], column=e_cell[1] + 2).value if e_cell else "N/mm2"
@@ -3865,14 +5634,33 @@ def read_input_xlsx(path: str) -> Tuple[Config, Material, SolverSettings, List[S
         deflection_limit=defl_lim
     )
 
-    # --- ソルバ設定 ---
+    # --- solver settings ---
     tol = float(find_value_right_of_label(ws, r"^\s*tol\b", default=1e-6))
     max_iter = int(float(find_value_right_of_label(ws, r"max_iter", default=5)))
     n_div = int(float(find_value_right_of_label(ws, r"n_div", default=2000)))
     setts = SolverSettings(tol=tol, max_iter=max_iter, n_div=n_div)
 
-    # --- 断面候補 ---
-    sections = read_sections_table(ws)
+    # --- section table ---
+    if "SECTION_DB" in wb.sheetnames:
+        db_sections = read_sections_table(
+            wb["SECTION_DB"],
+            source_sheet="SECTION_DB",
+            require_use_true=True,
+        )
+        selected_names = read_section_selection_names(ws)
+        if selected_names:
+            sec_map = {s.name: s for s in db_sections}
+            missing = [nm for nm in selected_names if nm not in sec_map]
+            if missing:
+                miss_txt = ", ".join(missing[:10])
+                raise ValueError(
+                    f"Selected SectionName not found in SECTION_DB (Use=TRUE): {miss_txt}"
+                )
+            sections = [sec_map[nm] for nm in selected_names]
+        else:
+            sections = db_sections
+    else:
+        sections = read_sections_table(ws, source_sheet="INPUT", require_use_true=False)
 
     cfg = Config(
         Lx=Lx, Ly=Ly, q=q, loads=loads, load_share_model=load_share_model,
@@ -3938,7 +5726,27 @@ def write_solution_summary(ws, row0: int, title: str, sol: Optional[Solution]) -
 def write_candidates_table(ws, row0: int, rows: List[CandidateRow]) -> int:
     ws.cell(row=row0, column=1, value="All candidates (Mode-A only)").font = Font(bold=True)
     row0 += 1
-    headers = ["CaseNo", "CaseID", "System", "Dir", "Pitch[m]", "N_MAIN", "N_TRANS", "MaxRankUsed", "TotalWeight[kN]", "Mmax[kN*m]", "Vmax[kN]", "dmax[mm]", "utilMax", "OK/NG"]
+    headers = [
+        "CaseNo",
+        "CaseID",
+        "CaseScope",
+        "DedupGroup",
+        "DedupCaseNo",
+        "MapDedupCaseNo",
+        "RawMembers",
+        "System",
+        "Dir",
+        "Pitch[m]",
+        "N_MAIN",
+        "N_TRANS",
+        "MaxRankUsed",
+        "TotalWeight[kN]",
+        "Mmax[kN*m]",
+        "Vmax[kN]",
+        "dmax[mm]",
+        "utilMax",
+        "OK/NG",
+    ]
     for j, h in enumerate(headers, start=1):
         write_header(ws, row0, j, h)
     row0 += 1
@@ -3946,10 +5754,20 @@ def write_candidates_table(ws, row0: int, rows: List[CandidateRow]) -> int:
     # Keep candidate order (CaseNo) aligned with PDF pages.
     rows_sorted = sorted(rows, key=lambda r: int(r.cand_no))
     for r in rows_sorted:
+        raw_members = ",".join(str(x) for x in r.raw_case_members) if r.raw_case_members else ""
         out = [
             r.cand_no,
             r.cand_id,
-            r.system, r.direction, _pitch_text(r.direction, r.pitch, r.pitch_y), r.n_main, r.n_trans,
+            r.case_scope,
+            r.dedup_group_key,
+            r.dedup_case_no if r.dedup_case_no is not None else "",
+            r.mapped_dedup_case_no if r.mapped_dedup_case_no is not None else "",
+            raw_members,
+            r.system,
+            r.direction,
+            _pitch_text(r.direction, r.pitch, r.pitch_y),
+            r.n_main,
+            r.n_trans,
             r.max_rank_used if r.ok else "",
             round(r.total_weight, 6) if math.isfinite(r.total_weight) else "",
             round(r.Mmax, 6),
@@ -4075,6 +5893,599 @@ def write_member_list(ws, row0: int, title: str, sol: Optional[Solution]) -> int
     return r + 2
 
 
+def _resample_ana_arrays_to_fixed_divisions(
+    ana: Dict[str, object],
+    n_div_out: int = 20,
+) -> Tuple[List[float], List[float], List[float], List[float]]:
+    """
+    Resample analysis arrays to equally spaced x over member length.
+    This is for report display only and does not affect design checks.
+    """
+    try:
+        n_out = int(n_div_out)
+    except Exception:
+        n_out = 20
+    n_out = max(1, n_out)
+
+    xs_raw = [float(v) for v in list(ana.get("xs", []))]
+    V_raw = [float(v) for v in list(ana.get("V", []))]
+    M_raw = [float(v) for v in list(ana.get("M", []))]
+    y_raw = [float(v) for v in list(ana.get("y", []))]
+
+    n_raw = len(xs_raw)
+    if n_raw < 2:
+        return xs_raw, V_raw, M_raw, y_raw
+
+    L = float(xs_raw[-1])
+    xs_out = [L * i / n_out for i in range(n_out + 1)]
+
+    def _interp(vals: List[float], xq: float) -> float:
+        if not vals:
+            return float("nan")
+        if len(vals) != n_raw:
+            return float("nan")
+        if xq <= xs_raw[0]:
+            return vals[0]
+        if xq >= xs_raw[-1]:
+            return vals[-1]
+        j = 0
+        while j + 1 < n_raw and xs_raw[j + 1] < xq:
+            j += 1
+        x0, x1 = xs_raw[j], xs_raw[j + 1]
+        v0, v1 = vals[j], vals[j + 1]
+        if abs(x1 - x0) <= 1e-15:
+            return v0
+        t = (xq - x0) / (x1 - x0)
+        return v0 + (v1 - v0) * t
+
+    V_out = [_interp(V_raw, xq) for xq in xs_out]
+    M_out = [_interp(M_raw, xq) for xq in xs_out]
+    y_out = [_interp(y_raw, xq) for xq in xs_out]
+    return xs_out, V_out, M_out, y_out
+
+
+def _resolve_section_for_member(mc: MemberCheck, sections: List[Section]) -> Optional[Section]:
+    sec = next((s for s in sections if s.rank == mc.section_rank and s.name == mc.section_name), None)
+    if sec is None:
+        sec = next((s for s in sections if s.name == mc.section_name), None)
+    return sec
+
+
+def _pick_worst_member(best: Solution) -> Optional[MemberCheck]:
+    if not best.member_checks:
+        return None
+    if best.worst_member_id:
+        mc = next((m for m in best.member_checks if m.beam_id == best.worst_member_id), None)
+        if mc is not None:
+            return mc
+    return max(best.member_checks, key=lambda m: (float(m.util_max), int(m.beam_no), str(m.beam_id)))
+
+
+def _estimate_main_member_slab_share(
+    cfg: Config,
+    best: Solution,
+    mc: MemberCheck,
+) -> Tuple[Optional[float], Optional[float], str]:
+    """
+    Estimate effective slab load share for a MAIN member from selected response values.
+    Returns (q_used, slab_share, note), where slab_share = q_used / q_input.
+    """
+    eps = 1e-12
+    if mc.member_type != "MAIN":
+        return None, None, "member is not MAIN"
+
+    try:
+        q_input = float(cfg.q)
+    except Exception:
+        return None, None, "invalid q_input"
+    if not math.isfinite(q_input):
+        return None, None, "non-finite q_input"
+
+    lsm = str(cfg.load_share_model or "").strip().upper()
+    bg = next((b for b in best.main_geoms if b.beam_id == mc.beam_id), None)
+    if bg is None:
+        return None, None, f"BeamGeom not found: {mc.beam_id}"
+
+    q_used: Optional[float] = None
+    note = ""
+
+    if lsm == "KAMEKKO":
+        L = max(0.0, float(bg.span))
+        tl = max(0.0, float(bg.trib_left))
+        tr = max(0.0, float(bg.trib_right))
+        trib_peak = min(tl, L * 0.5) + min(tr, L * 0.5)
+        if trib_peak > eps:
+            q_used = (float(mc.w_udl_max) - float(mc.w_g)) / trib_peak
+        else:
+            note = "trib_peak too small for KAMEKKO"
+    elif lsm == "ONEWAY":
+        trib_width = max(0.0, float(bg.trib_width))
+        if trib_width > eps:
+            q_used = (float(mc.w_udl) - float(mc.w_g)) / trib_width
+        else:
+            note = "trib_width too small for ONEWAY"
+    else:
+        note = f"unsupported load model: {lsm if lsm else 'UNKNOWN'}"
+
+    if q_used is not None:
+        if not math.isfinite(float(q_used)):
+            q_used = None
+            note = "q_used became non-finite"
+        elif float(q_used) < eps:
+            q_used = 0.0
+
+    slab_share: Optional[float] = None
+    if q_used is not None and q_input > eps:
+        slab_share = float(q_used) / float(q_input)
+        if not math.isfinite(slab_share):
+            slab_share = None
+            note = "slab_share became non-finite"
+        elif slab_share < eps:
+            slab_share = 0.0
+    elif q_used is not None and q_input <= eps:
+        note = "q_input too small"
+
+    return q_used, slab_share, note
+
+
+def _rebuild_member_arrays_for_member(
+    cfg: Config,
+    mat: Material,
+    setts: SolverSettings,
+    sections: List[Section],
+    best: Solution,
+    mc: MemberCheck,
+) -> Tuple[Optional[Section], Optional[Dict[str, object]], str]:
+    sec = _resolve_section_for_member(mc, sections)
+    if sec is None:
+        return None, None, f"Section not found: {mc.section_name} (rank={mc.section_rank})"
+
+    try:
+        if mc.member_type == "MAIN":
+            bg = next((b for b in best.main_geoms if b.beam_id == mc.beam_id), None)
+            if bg is None:
+                return sec, None, f"BeamGeom not found: {mc.beam_id}"
+
+            q_input = float(cfg.q)
+            _q_used, slab_share, share_note = _estimate_main_member_slab_share(cfg, best, mc)
+            if slab_share is not None:
+                q_for_recheck = q_input * float(slab_share)
+                msg = ""
+            else:
+                q_for_recheck = q_input
+                msg = f"q_for_recheck fallback to q_input (slab_share unknown: {share_note})"
+
+            _bc, ana = check_member(
+                member_type="MAIN",
+                span_dir=bg.direction,
+                span=bg.span,
+                pos_or_fixed=bg.pos,
+                left=None,
+                right=None,
+                trib_width=bg.trib_width,
+                trib_left=bg.trib_left,
+                trib_right=bg.trib_right,
+                load_share_model=cfg.load_share_model,
+                q=q_for_recheck,
+                point_loads=bg.point_along,
+                section=sec,
+                mat=mat,
+                setts=setts,
+                return_arrays=True,
+            )
+            return sec, ana, msg
+
+        td = next((t for t in best.transfer_defs if t.tb_id == mc.beam_id), None)
+        if td is None:
+            return sec, None, f"TransferDef not found: {mc.beam_id}"
+        Ltb = td.right_pos - td.left_pos
+        _bc, ana = check_member(
+            member_type="TRANS",
+            span_dir=td.span_dir,
+            span=Ltb,
+            pos_or_fixed=td.fixed_coord,
+            left=td.left_pos,
+            right=td.right_pos,
+            trib_width=0.0,
+            trib_left=0.0,
+            trib_right=0.0,
+            load_share_model="ONEWAY",
+            q=cfg.q,
+            point_loads=[(td.P, td.a_tb)],
+            section=sec,
+            mat=mat,
+            setts=setts,
+            return_arrays=True,
+        )
+        return sec, ana, ""
+    except Exception as e:
+        return sec, None, f"Failed to rebuild arrays: {type(e).__name__}: {e}"
+
+
+def _rebuild_member_arrays_for_best_member(
+    cfg: Config,
+    mat: Material,
+    setts: SolverSettings,
+    sections: List[Section],
+    best: Optional[Solution],
+) -> Tuple[Optional[MemberCheck], Optional[Section], Optional[Dict[str, object]], str]:
+    if best is None or (not best.ok):
+        return None, None, None, "NO FEASIBLE SOLUTION"
+
+    mc = _pick_worst_member(best)
+    if mc is None:
+        return None, None, None, "Worst member not found"
+
+    sec, ana, msg = _rebuild_member_arrays_for_member(cfg, mat, setts, sections, best, mc)
+    if sec is None:
+        return mc, None, None, f"Section not found for worst member: {mc.section_name} (rank={mc.section_rank})"
+    return mc, sec, ana, msg
+
+
+def _format_point_load_positions_for_member(cfg: Config, best: Solution, mc: MemberCheck) -> str:
+    parts: List[str] = []
+
+    if mc.member_type == "MAIN":
+        bg = next((b for b in best.main_geoms if b.beam_id == mc.beam_id), None)
+        if bg is not None:
+            pts = sorted((float(P), float(a)) for P, a in bg.point_along)
+            for i, (P, a) in enumerate(pts, start=1):
+                if str(mc.direction).upper() == "X":
+                    gx = float(a)
+                    gy = float(bg.pos)
+                else:
+                    gx = float(bg.pos)
+                    gy = float(a)
+                parts.append(f"L{i}:P={P:.3g}kN a={a:.3g}m (x={gx:.3g},y={gy:.3g})")
+            if parts:
+                return "; ".join(parts)
+            return "-"
+
+    if mc.member_type == "TRANS":
+        td = next((t for t in best.transfer_defs if t.tb_id == mc.beam_id), None)
+        if td is not None:
+            a = float(td.a_tb)
+            if str(td.span_dir).upper() == "X":
+                gx = float(td.left_pos) + a
+                gy = float(td.fixed_coord)
+            else:
+                gx = float(td.fixed_coord)
+                gy = float(td.left_pos) + a
+            return f"{td.load_id}:P={float(td.P):.3g}kN a={a:.3g}m (x={gx:.3g},y={gy:.3g})"
+
+    if int(mc.n_point) > 0:
+        return f"{int(mc.n_point)} point load(s) (position detail unavailable)"
+    return "-"
+
+
+def _kamekko_load_detail_for_member(cfg: Config, best: Solution, mc: MemberCheck) -> str:
+    lsm = str(cfg.load_share_model or "").strip().upper()
+    if mc.member_type != "MAIN":
+        return "-"
+    q_input = float(cfg.q)
+    q_input_txt = f"{q_input:.6g}" if math.isfinite(q_input) else "unknown"
+    _q_used, slab_share, note = _estimate_main_member_slab_share(cfg, best, mc)
+    slab_share_txt = (f"{float(slab_share):.6g}" if slab_share is not None else "unknown")
+    bg = next((b for b in best.main_geoms if b.beam_id == mc.beam_id), None)
+    note_suffix = (f"; note={note}" if note else "")
+
+    if bg is None:
+        if lsm == "KAMEKKO":
+            return (
+                "w(x)=q_input*slab_share*(min(tl,x,L-x)+min(tr,x,L-x))+w_g; "
+                f"q_input={q_input_txt}, slab_share={slab_share_txt}, tl=unknown, tr=unknown, L=unknown{note_suffix}"
+            )
+        return f"model={lsm if lsm else 'UNKNOWN'}, q_input={q_input_txt}, slab_share={slab_share_txt}{note_suffix}"
+
+    tl = float(bg.trib_left)
+    tr = float(bg.trib_right)
+    L = float(bg.span)
+    if lsm == "KAMEKKO":
+        return (
+            "w(x)=q_input*slab_share*(min(tl,x,L-x)+min(tr,x,L-x))+w_g; "
+            f"q_input={q_input_txt}, slab_share={slab_share_txt}, tl={tl:.6g}, tr={tr:.6g}, L={L:.6g}{note_suffix}"
+        )
+
+    return (
+        f"model={lsm if lsm else 'UNKNOWN'}, q_input={q_input_txt}, slab_share={slab_share_txt}, "
+        f"trib_width={float(bg.trib_width):.6g}{note_suffix}"
+    )
+
+
+def write_calc_best_beams_sheet(
+    wb,
+    cfg: Config,
+    mat: Material,
+    setts: SolverSettings,
+    sections: List[Section],
+    best: Optional[Solution],
+) -> None:
+    if "CALC_BEST_BEAMS" in wb.sheetnames:
+        del wb["CALC_BEST_BEAMS"]
+    ws = wb.create_sheet("CALC_BEST_BEAMS")
+
+    widths = [
+        8, 12, 10, 8, 12, 10, 10, 10, 8, 22, 11, 11, 11, 8,
+        46, 60,
+        12, 12, 9, 11, 11, 9, 10, 10, 9, 10, 10, 8,
+    ]
+    for i, w in enumerate(widths, start=1):
+        set_col_width(ws, i, w)
+
+    ws.cell(row=1, column=1, value="CALC_BEST_BEAMS (Best-case beam calculation sheet)").font = Font(bold=True, size=14)
+
+    if best is None or (not best.ok):
+        ws.cell(row=3, column=1, value="NO FEASIBLE SOLUTION").font = Font(bold=True)
+        return
+
+    def _val_or_blank(v: object, nd: int = 6) -> object:
+        if isinstance(v, (int, float)):
+            fv = float(v)
+            if math.isfinite(fv):
+                return round(fv, nd)
+        return ""
+
+    sum_headers = ["BestDirection", "BestSystem", "BestPitch", "BestPitchY", "TotalWeight[kN]", "UtilMax", "WorstMemberID"]
+    sum_values = [
+        best.direction,
+        best.system,
+        _val_or_blank(best.pitch),
+        _val_or_blank(best.pitch_y) if best.pitch_y is not None else "",
+        _val_or_blank(best.total_weight),
+        _val_or_blank(best.util_max),
+        best.worst_member_id,
+    ]
+    for j, h in enumerate(sum_headers, start=1):
+        write_header(ws, 3, j, h)
+    for j, v in enumerate(sum_values, start=1):
+        ws.cell(row=4, column=j, value=v)
+
+    ws.cell(row=6, column=1, value="Load definition details").font = Font(bold=True)
+    ws.cell(row=7, column=1, value="Concentrated load position format: L#:P=<kN> a=<m> (x=<m>,y=<m>)").font = Font(italic=True)
+    ws.cell(
+        row=8,
+        column=1,
+        value=(
+            "KAMEKKO (MAIN) definition: w(x)=q_input*slab_share*(min(tl,x,L-x)+min(tr,x,L-x))+w_g; "
+            "q_input is INPUT value (fixed display), slab_share is estimated from selected member response (w_avg/w_max)."
+        ),
+    ).font = Font(italic=True)
+    ws.cell(
+        row=9,
+        column=1,
+        value=(
+            "Note: w_avg/w_max are report values. Design judgement (OK/NG) uses Mmax, Vmax, dmax"
+            " -> util_M/util_V/util_d/util_max."
+        ),
+    ).font = Font(italic=True)
+
+    ws.cell(row=10, column=1, value="All beam summary (MAIN+TRANS) - best solution").font = Font(bold=True)
+    headers = [
+        "No", "BeamID", "Type", "Dir", "Pos/Fixed[m]", "Left[m]", "Right[m]", "Span[m]",
+        "Rank", "Section", "w_g[kN/m]", "w_avg[kN/m]", "w_max[kN/m]", "Npoint",
+        "PointLoadPos", "KamekkoDef",
+        "Mmax[kN*m]", "Mallow[kN*m]", "M_ratio",
+        "Vmax[kN]", "Vallow[kN]", "V_ratio",
+        "dmax[mm]", "dallow[mm]", "d_ratio",
+        "Governing", "util_max", "OK/NG",
+    ]
+    for j, h in enumerate(headers, start=1):
+        write_header(ws, 11, j, h)
+
+    checks = sorted(best.member_checks, key=lambda x: (0 if x.member_type == "MAIN" else 1, x.beam_no, x.beam_id))
+    r = 12
+    for mc in checks:
+        sec = _resolve_section_for_member(mc, sections)
+        m_allow: Optional[float] = None
+        v_allow: Optional[float] = None
+        if sec is not None:
+            try:
+                _A_m2, Av_m2, Z_m3, _I_m4 = get_section_props_m(sec)
+                m_allow = float(Z_m3) * float(mat.fb_kN_m2)
+                v_allow = float(Av_m2) * float(mat.fv_kN_m2)
+            except Exception:
+                m_allow = None
+                v_allow = None
+
+        d_allow_mm = float(mc.span) / float(mat.deflection_limit) * 1000.0 if float(mat.deflection_limit) > 0.0 else None
+        m_ratio = float(mc.util_M)
+        v_ratio = float(mc.util_V)
+        d_ratio = float(mc.util_d)
+        ratios = [("M", m_ratio), ("V", v_ratio), ("d", d_ratio)]
+        governing = max(ratios, key=lambda kv: kv[1])[0] if ratios else ""
+        point_pos_txt = _format_point_load_positions_for_member(cfg, best, mc)
+        kamekko_txt = _kamekko_load_detail_for_member(cfg, best, mc)
+
+        out = [
+            mc.beam_no,
+            mc.beam_id,
+            mc.member_type,
+            mc.direction,
+            _val_or_blank(mc.pos_or_fixed),
+            _val_or_blank(mc.left),
+            _val_or_blank(mc.right),
+            _val_or_blank(mc.span),
+            mc.section_rank,
+            mc.section_name,
+            _val_or_blank(mc.w_g),
+            _val_or_blank(mc.w_udl),
+            _val_or_blank(mc.w_udl_max),
+            mc.n_point,
+            point_pos_txt,
+            kamekko_txt,
+            _val_or_blank(mc.Mmax),
+            _val_or_blank(m_allow),
+            _val_or_blank(m_ratio),
+            _val_or_blank(mc.Vmax),
+            _val_or_blank(v_allow),
+            _val_or_blank(v_ratio),
+            _val_or_blank(mc.dmax * 1000.0),
+            _val_or_blank(d_allow_mm),
+            _val_or_blank(d_ratio),
+            governing,
+            _val_or_blank(mc.util_max),
+            "OK" if mc.ok else "NG",
+        ]
+        for j, v in enumerate(out, start=1):
+            ws.cell(row=r, column=j, value=v)
+        ws.cell(row=r, column=15).alignment = Alignment(vertical="center", wrap_text=True)
+        ws.cell(row=r, column=16).alignment = Alignment(vertical="center", wrap_text=True)
+        r += 1
+
+    r += 2
+    ws.cell(row=r, column=1, value="Worst member arrays (x-V-M-deflection)").font = Font(bold=True)
+    r += 1
+
+    mc_worst, sec_worst, ana, msg = _rebuild_member_arrays_for_best_member(cfg, mat, setts, sections, best)
+    if mc_worst is None:
+        ws.cell(row=r, column=1, value=msg if msg else "Worst member not found").font = Font(bold=True)
+        return
+
+    ws.cell(
+        row=r,
+        column=1,
+        value=f"Worst member: {mc_worst.beam_id} (No={mc_worst.beam_no}, type={mc_worst.member_type}, dir={mc_worst.direction}, span={mc_worst.span:g} m)",
+    ).font = Font(bold=True)
+    r += 1
+    if sec_worst is None:
+        ws.cell(row=r, column=1, value=f"Section unresolved: rank={mc_worst.section_rank}, {mc_worst.section_name}").font = Font(bold=True)
+    else:
+        ws.cell(row=r, column=1, value=f"Section: rank={sec_worst.rank}, {sec_worst.name}").font = Font(bold=True)
+    r += 1
+    ws.cell(
+        row=r,
+        column=1,
+        value=f"Point loads: {_format_point_load_positions_for_member(cfg, best, mc_worst)}",
+    ).font = Font(italic=True)
+    r += 1
+    ws.cell(
+        row=r,
+        column=1,
+        value=f"Load model detail: {_kamekko_load_detail_for_member(cfg, best, mc_worst)}",
+    ).font = Font(italic=True)
+    r += 1
+
+    if ana is None:
+        ws.cell(row=r, column=1, value=(msg if msg else "No arrays returned")).font = Font(italic=True)
+        return
+
+    if msg:
+        ws.cell(row=r, column=1, value=msg).font = Font(italic=True)
+        r += 1
+
+    arr_headers = ["x[m]", "V[kN]", "M[kN*m]", "y[mm]"]
+    for c, h in enumerate(arr_headers, start=1):
+        write_header(ws, r, c, h)
+    r += 1
+
+    xs, V, M, y = _resample_ana_arrays_to_fixed_divisions(ana, n_div_out=20)
+    n = len(xs)
+    for i in range(n):
+        ws.cell(row=r, column=1, value=float(xs[i]) if i < len(xs) else None)
+        ws.cell(row=r, column=2, value=float(V[i]) if i < len(V) else None)
+        ws.cell(row=r, column=3, value=float(M[i]) if i < len(M) else None)
+        ws.cell(row=r, column=4, value=(float(y[i]) * 1000.0) if i < len(y) else None)
+        r += 1
+
+    r += 1
+    ws.cell(
+        row=r,
+        column=1,
+        value="All BeamID x/V/M/y arrays are exported to sheet 'CALC_BEST_BEAM_ARRAYS'.",
+    ).font = Font(italic=True)
+
+
+def write_calc_best_beam_arrays_sheet(
+    wb,
+    cfg: Config,
+    mat: Material,
+    setts: SolverSettings,
+    sections: List[Section],
+    best: Optional[Solution],
+) -> None:
+    if "CALC_BEST_BEAM_ARRAYS" in wb.sheetnames:
+        del wb["CALC_BEST_BEAM_ARRAYS"]
+    ws = wb.create_sheet("CALC_BEST_BEAM_ARRAYS")
+    set_col_width(ws, 1, 10)
+    set_col_width(ws, 2, 14)
+    set_col_width(ws, 3, 14)
+    set_col_width(ws, 4, 14)
+
+    ws.cell(row=1, column=1, value="CALC_BEST_BEAM_ARRAYS (all BeamID x-V-M-deflection)").font = Font(bold=True, size=14)
+    ws.cell(row=2, column=1, value="x[m] is fixed to 20 divisions (21 points) for each member.").font = Font(italic=True)
+
+    if best is None or (not best.ok):
+        ws.cell(row=4, column=1, value="NO FEASIBLE SOLUTION").font = Font(bold=True)
+        return
+
+    checks = sorted(best.member_checks, key=lambda x: (0 if x.member_type == "MAIN" else 1, x.beam_no, x.beam_id))
+    r = 4
+    for mc in checks:
+        sec, ana, msg = _rebuild_member_arrays_for_member(cfg, mat, setts, sections, best, mc)
+        ws.cell(
+            row=r,
+            column=1,
+            value=(
+                f"BeamID={mc.beam_id}, No={mc.beam_no}, Type={mc.member_type}, Dir={mc.direction}, "
+                f"Span={mc.span:g}m, Section={mc.section_name}(R{mc.section_rank})"
+            ),
+        ).font = Font(bold=True)
+        r += 1
+
+        if sec is None:
+            ws.cell(row=r, column=1, value=(msg if msg else "Section not found")).font = Font(italic=True)
+            r += 2
+            continue
+        if msg:
+            ws.cell(row=r, column=1, value=msg).font = Font(italic=True)
+            r += 1
+        if ana is None:
+            ws.cell(row=r, column=1, value="No arrays returned").font = Font(italic=True)
+            r += 2
+            continue
+
+        headers = ["x[m]", "V[kN]", "M[kN*m]", "y[mm]"]
+        for c, h in enumerate(headers, start=1):
+            write_header(ws, r, c, h)
+        r += 1
+
+        xs, V, M, y = _resample_ana_arrays_to_fixed_divisions(ana, n_div_out=20)
+        for i in range(len(xs)):
+            ws.cell(row=r, column=1, value=float(xs[i]))
+            ws.cell(row=r, column=2, value=float(V[i]) if i < len(V) else None)
+            ws.cell(row=r, column=3, value=float(M[i]) if i < len(M) else None)
+            ws.cell(row=r, column=4, value=float(y[i]) * 1000.0 if i < len(y) else None)
+            r += 1
+        r += 1
+
+
+def write_input_warnings_sheet(wb) -> None:
+    if "INPUT_WARNINGS" in wb.sheetnames:
+        del wb["INPUT_WARNINGS"]
+    ws = wb.create_sheet("INPUT_WARNINGS")
+
+    headers = ["sheet", "row", "section", "field", "action", "detail", "value"]
+    widths = [16, 8, 28, 16, 14, 64, 18]
+    for c, (h, w) in enumerate(zip(headers, widths), start=1):
+        set_col_width(ws, c, w)
+        ws.cell(row=1, column=c, value=h).font = Font(bold=True)
+
+    if not _INPUT_WARNINGS:
+        ws.cell(row=2, column=1, value="No input warnings.")
+        return
+
+    r = 2
+    for w in _INPUT_WARNINGS:
+        ws.cell(row=r, column=1, value=w.get("sheet"))
+        ws.cell(row=r, column=2, value=w.get("row"))
+        ws.cell(row=r, column=3, value=w.get("section"))
+        ws.cell(row=r, column=4, value=w.get("field"))
+        ws.cell(row=r, column=5, value=w.get("action"))
+        ws.cell(row=r, column=6, value=w.get("detail"))
+        ws.cell(row=r, column=7, value=w.get("value"))
+        r += 1
+
+
 def write_result_xlsx(
     in_path: str,
     out_path: str,
@@ -4101,12 +6512,18 @@ def write_result_xlsx(
     ws.cell(
         row=r,
         column=1,
-        value="Notes: Units are kN, m. E/fb/fv are converted from N/mm2 to kN/m2. Mode-B is removed. Layouts are enumerated by LONG/SHORT split and deduplicated. Point-load beam placement uses Rule-A (nearest-beam move) + Rule-C (force beam under load).",
+        value="Notes: Units are kN, m. E/fb/fv are converted from N/mm2 to kN/m2. Mode-B is removed. Layouts are enumerated by LONG/SHORT split (Raw + Dedup outputs). Concentrated-load support beams are added when needed: if no beam exists at load coordinate, a beam is added in the direction with shorter beam span length at that load point. Added beam count is bounded by uncovered-load count (duplicates merged). w_avg/w_max are report values only; design judgement uses Mmax/Vmax/dmax (util_M/util_V/util_d/util_max).",
     ).font = Font(italic=True)
     r += 2
 
     r = write_solution_summary(ws, r, "Mode-A best (total weight minimum)", best)
     r = write_candidates_table(ws, r, cand_rows)
+    ws.cell(
+        row=r,
+        column=1,
+        value="Note: In the following beam table, w_avg/w_max are reporting fields. Section check pass/fail is based on util_M/util_V/util_d/util_max.",
+    ).font = Font(italic=True)
+    r += 2
 
     r = write_member_checks(ws, r, "Beam checks (per member) - best solution", best)
     r = write_allocations(ws, r, "Load allocation to supports (includes TRANS/MAIN reactions) - best solution", best)
@@ -4115,10 +6532,15 @@ def write_result_xlsx(
     r += 1
     ws.cell(row=r, column=1, value="PLAN view is written to sheet 'LAYOUT' (cells only).").font = Font(italic=True)
 
+    # best-case calculation sheet
+    write_calc_best_beams_sheet(wb, cfg, mat, setts, sections, best)
+    write_calc_best_beam_arrays_sheet(wb, cfg, mat, setts, sections, best)
+
     # layout sheet
     write_layout_sheet(wb, cfg, best)
 
-    # verbose / debug sheets
+    # input warnings + verbose / debug sheets
+    write_input_warnings_sheet(wb)
     write_verbose_sheets(wb, cfg, mat, setts, sections, cand_rows, best)
 
     wb.save(out_path)
@@ -4146,26 +6568,26 @@ def write_layout_sheet(wb, cfg: Config, best: Optional[Solution]) -> None:
 
 def draw_plan(ws, top: int, left: int, cfg: Config, sol: Solution, title: str) -> int:
     """
-    Plan-only sheet (no tables). Square cells are applied only to the grid area.
+    Plan sheet with plan view + right-side member table.
     - MAIN beams: light blue
     - TRANS beams: yellow
     - Worst member: red fill
-    - Point load: red ●ID at actual position
-    - Allocation marker: blue ▲ID on receiving support line
+    - Point load marker: red P-<LoadID>
+    - Allocation marker: blue T-<LoadID>
     """
-    # grid size (m per cell)
     grid = 0.25
     nx = int(round(cfg.Lx / grid)) + 1
     ny = int(round(cfg.Ly / grid)) + 1
 
-    # styles
     fill_main = PatternFill("solid", fgColor="DDEBF7")
     fill_trans = PatternFill("solid", fgColor="FFF2CC")
-    fill_worst = PatternFill("solid", fgColor="FF0000")  # red
+    fill_worst = PatternFill("solid", fgColor="FF0000")
+    fill_worst_row = PatternFill("solid", fgColor="FCE4D6")
     fill_blank = PatternFill("solid", fgColor="FFFFFF")
+    fill_header = PatternFill("solid", fgColor="EDEDED")
 
     font_small = Font(size=9)
-    font_bold = Font(bold=True)
+    font_table = Font(size=9)
 
     border_thick = Border(left=Side(style="thick"), right=Side(style="thick"),
                           top=Side(style="thick"), bottom=Side(style="thick"))
@@ -4173,10 +6595,12 @@ def draw_plan(ws, top: int, left: int, cfg: Config, sol: Solution, title: str) -
                          right=Side(style="thin", color="D9D9D9"),
                          top=Side(style="thin", color="D9D9D9"),
                          bottom=Side(style="thin", color="D9D9D9"))
+    border_cell = Border(left=Side(style="thin"), right=Side(style="thin"),
+                         top=Side(style="thin"), bottom=Side(style="thin"))
 
-    # coordinate mapping
     grid_left = left + 2
     grid_top = top + 2
+    grid_right = grid_left + nx - 1
 
     def x_to_c(xm: float) -> int:
         return grid_left + int(round(xm / grid))
@@ -4184,20 +6608,95 @@ def draw_plan(ws, top: int, left: int, cfg: Config, sol: Solution, title: str) -
     def y_to_r(ym: float) -> int:
         return grid_top + int(round(ym / grid))
 
-    # Title lines
+    def _clamp(v: float, lo: float, hi: float) -> float:
+        return max(float(lo), min(float(hi), float(v)))
+
+    def _safe_float(v: Optional[float], default: float) -> float:
+        try:
+            if v is None:
+                return float(default)
+            return float(v)
+        except Exception:
+            return float(default)
+
+    def _safe_put_label(rr: int, cc: int, text: str, font: Optional[Font] = None) -> None:
+        rr0 = max(1, int(rr))
+        cc0 = max(1, int(cc))
+        candidates = [cc0, cc0 + 1, cc0 - 1, cc0 + 2, cc0 - 2]
+        for c in candidates:
+            if c < 1:
+                continue
+            cell = ws.cell(row=rr0, column=c)
+            v = cell.value
+            if v is None or str(v).strip() == "":
+                cell.value = text
+                if font is not None:
+                    cell.font = font
+                cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=False)
+                return
+        cell = ws.cell(row=rr0, column=cc0)
+        cell.value = text
+        if font is not None:
+            cell.font = font
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=False)
+
+    def _collect_layout_members() -> List[Dict[str, object]]:
+        rows: List[Dict[str, object]] = []
+        checks = sorted(sol.member_checks, key=lambda x: (0 if x.member_type == "MAIN" else 1, x.beam_no, x.beam_id))
+        for mc in checks:
+            direction = str(mc.direction).upper()
+            if direction not in ("X", "Y"):
+                continue
+
+            if direction == "X":
+                const = _clamp(_safe_float(mc.pos_or_fixed, 0.0), 0.0, float(cfg.Ly))
+                a0 = _clamp(_safe_float(mc.left, 0.0), 0.0, float(cfg.Lx))
+                a1 = _clamp(_safe_float(mc.right, float(cfg.Lx)), 0.0, float(cfg.Lx))
+                x0, x1 = sorted((a0, a1))
+                sx, sy = x0, const
+                ex, ey = x1, const
+            else:
+                const = _clamp(_safe_float(mc.pos_or_fixed, 0.0), 0.0, float(cfg.Lx))
+                a0 = _clamp(_safe_float(mc.left, 0.0), 0.0, float(cfg.Ly))
+                a1 = _clamp(_safe_float(mc.right, float(cfg.Ly)), 0.0, float(cfg.Ly))
+                y0, y1 = sorted((a0, a1))
+                sx, sy = const, y0
+                ex, ey = const, y1
+
+            rows.append({
+                "beam_no": int(mc.beam_no),
+                "beam_id": str(mc.beam_id),
+                "member_type": str(mc.member_type),
+                "direction": direction,
+                "section_rank": int(mc.section_rank),
+                "section_name": str(mc.section_name),
+                "start_x": float(sx),
+                "start_y": float(sy),
+                "end_x": float(ex),
+                "end_y": float(ey),
+                "is_worst": (str(mc.beam_id) == str(sol.worst_member_id)),
+            })
+        return rows
+
+    members = _collect_layout_members()
+    member_by_id = {str(m["beam_id"]): m for m in members}
+
     ws.cell(row=top, column=left, value=title).font = Font(bold=True)
     pitch_txt = _pitch_text(sol.direction, sol.pitch, sol.pitch_y)
-    ws.cell(row=top + 1, column=left, value=f"PLAN: system={sol.system}, dir={sol.direction}, pitch={pitch_txt}, totalW={sol.total_weight:.3f} kN, maxR={sol.max_rank_used}").font = font_small
+    ws.cell(
+        row=top + 1,
+        column=left,
+        value=f"PLAN: system={sol.system}, dir={sol.direction}, pitch={pitch_txt}, totalW={sol.total_weight:.3f} kN, maxR={sol.max_rank_used}",
+    ).font = font_small
+    ws.freeze_panes = ws.cell(row=grid_top, column=grid_left)
 
-    # Format square cells only for grid area (+ axis label margins)
-    col_w = 2.0   # about square with default row height
+    col_w = 2.0
     row_h = 12.0
     for c in range(grid_left, grid_left + nx):
         ws.column_dimensions[get_column_letter(c)].width = col_w
     for r in range(grid_top, grid_top + ny):
         ws.row_dimensions[r].height = row_h
 
-    # clear and grid
     for r in range(grid_top, grid_top + ny):
         for c in range(grid_left, grid_left + nx):
             cell = ws.cell(row=r, column=c, value="")
@@ -4205,7 +6704,6 @@ def draw_plan(ws, top: int, left: int, cfg: Config, sol: Solution, title: str) -
             cell.border = border_grid
             cell.alignment = Alignment(horizontal="center", vertical="center")
 
-    # thick boundary
     for c in range(grid_left, grid_left + nx):
         ws.cell(row=grid_top, column=c).border = border_thick
         ws.cell(row=grid_top + ny - 1, column=c).border = border_thick
@@ -4213,116 +6711,59 @@ def draw_plan(ws, top: int, left: int, cfg: Config, sol: Solution, title: str) -
         ws.cell(row=r, column=grid_left).border = border_thick
         ws.cell(row=r, column=grid_left + nx - 1).border = border_thick
 
-    # axis labels (integer meters only)
-    ws.cell(row=grid_top - 1, column=grid_left, value="y[m]→x[m]").font = font_small
+    ws.cell(row=grid_top - 1, column=grid_left, value="y[m] / x[m]").font = font_small
     for xm in range(0, int(math.floor(cfg.Lx)) + 1):
-        c = x_to_c(float(xm))
-        if grid_left <= c < grid_left + nx:
-            ws.cell(row=grid_top - 1, column=c, value=str(xm)).font = font_small
-
+        cc = x_to_c(float(xm))
+        if grid_left <= cc < grid_left + nx:
+            ws.cell(row=grid_top - 1, column=cc, value=str(xm)).font = font_small
     for ym in range(0, int(math.floor(cfg.Ly)) + 1):
-        r0 = y_to_r(float(ym))
-        if grid_top <= r0 < grid_top + ny:
-            ws.cell(row=r0, column=grid_left - 1, value=str(ym)).font = font_small
+        rr = y_to_r(float(ym))
+        if grid_top <= rr < grid_top + ny:
+            ws.cell(row=rr, column=grid_left - 1, value=str(ym)).font = font_small
 
-    # build lookup of checks by id
-    chk = {m.beam_id: m for m in sol.member_checks}
+    pin_cells = set()
+    for m in members:
+        is_worst = bool(m["is_worst"])
+        mtype = str(m["member_type"]).upper()
+        seg_fill = fill_worst if is_worst else (fill_main if mtype == "MAIN" else fill_trans)
+        sx = float(m["start_x"])
+        sy = float(m["start_y"])
+        ex = float(m["end_x"])
+        ey = float(m["end_y"])
+        direction = str(m["direction"])
 
-    # Draw MAIN beams
-    # MAIN beams stored as member_checks with member_type=MAIN => need their direction and pos
-    for mc in sol.member_checks:
-        if mc.member_type != "MAIN":
-            continue
-        pos = float(mc.pos_or_fixed) if mc.pos_or_fixed is not None else 0.0
-        is_worst = (mc.beam_id == sol.worst_member_id)
-
-        if mc.direction == "Y":
-            # MAIN beams are vertical (span Y), placed at x=pos
-            c = x_to_c(pos)
-            for r in range(grid_top, grid_top + ny):
-                cell = ws.cell(row=r, column=c)
-                cell.fill = fill_worst if is_worst else fill_main
+        if direction == "X":
+            rr = max(grid_top, min(grid_top + ny - 1, y_to_r(sy)))
+            c0 = max(grid_left, min(grid_right, x_to_c(sx)))
+            c1 = max(grid_left, min(grid_right, x_to_c(ex)))
+            for cc in range(min(c0, c1), max(c0, c1) + 1):
+                ws.cell(row=rr, column=cc).fill = seg_fill
+            c_start, c_end = min(c0, c1), max(c0, c1)
+            if c_end > c_start:
+                pin_cells.add((rr, c_start + 1))
+                pin_cells.add((rr, c_end - 1))
+            else:
+                pin_cells.add((rr, c_start))
         else:
-            # MAIN beams are horizontal (span X), placed at y=pos
-            r0 = y_to_r(pos)
-            for c in range(grid_left, grid_left + nx):
-                cell = ws.cell(row=r0, column=c)
-                cell.fill = fill_worst if is_worst else fill_main
+            cc = max(grid_left, min(grid_right, x_to_c(sx)))
+            r0 = max(grid_top, min(grid_top + ny - 1, y_to_r(sy)))
+            r1 = max(grid_top, min(grid_top + ny - 1, y_to_r(ey)))
+            for rr in range(min(r0, r1), max(r0, r1) + 1):
+                ws.cell(row=rr, column=cc).fill = seg_fill
+            r_start, r_end = min(r0, r1), max(r0, r1)
+            if r_end > r_start:
+                pin_cells.add((r_start + 1, cc))
+                pin_cells.add((r_end - 1, cc))
+            else:
+                pin_cells.add((r_start, cc))
 
-        # label (merged cell to avoid vertical text)
-        label = f"{mc.beam_no}"
-        if mc.direction == "Y":
-            c = x_to_c(pos)
-            c0 = max(grid_left, c - 1)
-            c1 = min(grid_left + nx - 1, c + 1)
-            ws.merge_cells(start_row=grid_top - 2, start_column=c0, end_row=grid_top - 2, end_column=c1)
-            lc = ws.cell(row=grid_top - 2, column=c0, value=label)
-        else:
-            r0 = y_to_r(pos)
-            # label to the left of the beam row
-            lc = ws.cell(row=r0, column=grid_left - 2, value=label)
-        lc.font = font_small
-        lc.alignment = Alignment(horizontal="center", vertical="center", wrap_text=False)
+        midx = 0.5 * (sx + ex)
+        midy = 0.5 * (sy + ey)
+        rr = max(grid_top, min(grid_top + ny - 1, y_to_r(midy)))
+        cc = max(grid_left, min(grid_right, x_to_c(midx)))
+        _safe_put_label(rr, cc, f"{int(m['beam_no'])}", Font(size=8, bold=True))
 
-    # Draw TRANS beams (span_dir is pitch axis; fixed_coord is perpendicular)
-    for td in sol.transfer_defs:
-        mc = chk.get(td.tb_id)
-        if mc is None:
-            continue
-        is_worst = (td.tb_id == sol.worst_member_id)
-
-        if td.span_dir == "X":
-            # horizontal trans at y=fixed_coord, x from left_pos to right_pos
-            r0 = y_to_r(td.fixed_coord)
-            c0 = x_to_c(td.left_pos)
-            c1 = x_to_c(td.right_pos)
-            for c in range(min(c0, c1), max(c0, c1) + 1):
-                cell = ws.cell(row=r0, column=c)
-                cell.fill = fill_worst if is_worst else fill_trans
-        else:
-            # vertical trans at x=fixed_coord
-            c0 = x_to_c(td.fixed_coord)
-            r0 = y_to_r(td.left_pos)
-            r1 = y_to_r(td.right_pos)
-            for r in range(min(r0, r1), max(r0, r1) + 1):
-                cell = ws.cell(row=r, column=c0)
-                cell.fill = fill_worst if is_worst else fill_trans
-
-        # label near mid span
-        midx = 0.5 * (td.left_pos + td.right_pos) if td.span_dir == "X" else td.fixed_coord
-        midy = td.fixed_coord if td.span_dir == "X" else 0.5 * (td.left_pos + td.right_pos)
-        u = chk.get(td.tb_id).util_max if td.tb_id in chk else None
-        label = f"{mc.beam_no}"
-
-        # place label with a small merged area to improve legibility
-        if td.span_dir == "X":
-            rr = max(grid_top + 1, min(grid_top + ny, y_to_r(midy) - 1))
-            cc0 = x_to_c(midx)
-            c1 = max(grid_left + 1, cc0 - 1)
-            c2 = min(grid_left + nx, cc0 + 1)
-            if c2 > c1:
-                ws.merge_cells(start_row=rr, start_column=c1, end_row=rr, end_column=c2)
-            lc = ws.cell(row=rr, column=c1, value=label)
-        else:
-            cc = max(grid_left + 1, min(grid_left + nx, x_to_c(midx) + 1))
-            rr0 = y_to_r(midy)
-            r1 = max(grid_top + 1, rr0 - 1)
-            r2 = min(grid_top + ny, rr0 + 1)
-            if r2 > r1:
-                ws.merge_cells(start_row=r1, start_column=cc, end_row=r2, end_column=cc)
-            lc = ws.cell(row=r1, column=cc, value=label)
-
-        lc.font = Font(size=8, bold=True)
-        lc.alignment = Alignment(horizontal="center", vertical="center")
-
-    # Point loads and allocation markers
-    # Point load marker ● at actual coordinate
-    # Allocation marker ▲ on receiving supports (MAIN beam or PERIM)
-    # We'll use allocation_rows + original load coordinates
-    load_map = {pl.load_id: pl for pl in cfg.loads}
-
-        # mark actual load and allocation marker
-    # - If actual (●) and allocation (▲) are mapped to the same cell, merge into one cell, e.g. "●▲P4".
+    load_map = {str(pl.load_id): pl for pl in cfg.loads}
     marks: Dict[Tuple[int, int], Dict[str, set]] = {}
 
     def add_mark(rr: int, cc: int, lid: str, kind: str) -> None:
@@ -4334,68 +6775,109 @@ def draw_plan(ws, top: int, left: int, cfg: Config, sol: Solution, title: str) -
         kinds = by_id.setdefault(lid, set())
         kinds.add(kind)
 
-    # (1) actual point load location
     for pl in cfg.loads:
-        rr = y_to_r(pl.y)
-        cc = x_to_c(pl.x)
-        add_mark(rr, cc, str(pl.load_id), "C")  # Circle
+        add_mark(y_to_r(pl.y), x_to_c(pl.x), str(pl.load_id), "P")
 
-    # (2) allocation markers (▲) on receiving supports (including TRANS supports)
     for lid, sup_id, _P in sol.allocation_rows:
-        if is_perim_support(str(sup_id)):
-            # outside boundary beam; show allocation marker at the actual load cell instead
-            pl = next((x for x in cfg.loads if str(x.load_id) == str(lid)), None)
-            if pl is not None:
-                rr = y_to_r(pl.y)
-                cc = x_to_c(pl.x)
-                add_mark(rr, cc, str(lid), "T")
-            continue
-
-        sup_mc = chk.get(sup_id)
-        if sup_mc is None:
-            continue
-
-        pl = next((x for x in cfg.loads if str(x.load_id) == str(lid)), None)
+        lid_s = str(lid)
+        pl = load_map.get(lid_s)
         if pl is None:
             continue
 
-        if sup_mc.direction == "Y" and sup_mc.pos_or_fixed is not None:
-            rr = y_to_r(pl.y)
-            cc = x_to_c(float(sup_mc.pos_or_fixed))
-            add_mark(rr, cc, str(lid), "T")
-        elif sup_mc.direction == "X" and sup_mc.pos_or_fixed is not None:
-            rr = y_to_r(float(sup_mc.pos_or_fixed))
-            cc = x_to_c(pl.x)
-            add_mark(rr, cc, str(lid), "T")
+        if is_perim_support(str(sup_id)):
+            add_mark(y_to_r(pl.y), x_to_c(pl.x), lid_s, "T")
+            continue
 
-    # write marks to sheet
+        sup = member_by_id.get(str(sup_id))
+        if sup is None:
+            continue
+
+        if str(sup["direction"]) == "Y":
+            add_mark(y_to_r(pl.y), x_to_c(float(sup["start_x"])), lid_s, "T")
+        elif str(sup["direction"]) == "X":
+            add_mark(y_to_r(float(sup["start_y"])), x_to_c(pl.x), lid_s, "T")
+
     for (rr, cc), by_id in marks.items():
         parts: List[str] = []
-        has_circle = False
+        has_point = False
         for lid, kinds in sorted(by_id.items(), key=lambda x: str(x[0])):
-            if "C" in kinds and "T" in kinds:
-                parts.append(f"◎{lid}")
-                has_circle = True
-            elif "C" in kinds:
-                parts.append(f"●{lid}")
-                has_circle = True
+            if "P" in kinds and "T" in kinds:
+                parts.append(f"P/T-{lid}")
+                has_point = True
+            elif "P" in kinds:
+                parts.append(f"P-{lid}")
+                has_point = True
             else:
-                parts.append(f"▲{lid}")
-        val = "/".join(parts)
-        cell = ws.cell(row=rr, column=cc, value=val)
-        cell.font = Font(color=("C00000" if has_circle else "1F4E79"), bold=True, size=9)
+                parts.append(f"T-{lid}")
+        cell = ws.cell(row=rr, column=cc, value="/".join(parts))
+        cell.font = Font(color=("C00000" if has_point else "1F4E79"), bold=True, size=9)
         cell.alignment = Alignment(horizontal="center", vertical="center")
-# Legend (below grid)
+
+    # Pin marker at one-cell-inside from member endpoints.
+    # Use ASCII symbol "o" to avoid encoding issues.
+    for rr, cc in sorted(pin_cells):
+        cell = ws.cell(row=rr, column=cc)
+        cur = "" if cell.value is None else str(cell.value).strip()
+        if cur == "":
+            cell.value = "o"
+            cell.font = Font(color="1F4E79", bold=True, size=8)
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+            continue
+        if cur.endswith("/o") or cur == "o" or cur.startswith("o/"):
+            continue
+        cell.value = f"{cur}/o"
+        has_point = ("P-" in cur)
+        cell.font = Font(color=("C00000" if has_point else "1F4E79"), bold=True, size=9)
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    table_left = grid_right + 3
+    table_top = grid_top
+    ws.cell(row=table_top - 1, column=table_left, value="Member info with endpoints").font = Font(bold=True, size=10)
+    headers = ["No", "BeamID", "Type", "Dir", "Rank", "Section", "Start(x,y)", "End(x,y)"]
+    col_widths = [6, 10, 8, 6, 6, 20, 17, 17]
+    for i, w in enumerate(col_widths):
+        set_col_width(ws, table_left + i, w)
+
+    for i, h in enumerate(headers):
+        cell = ws.cell(row=table_top, column=table_left + i, value=h)
+        cell.font = Font(bold=True)
+        cell.fill = fill_header
+        cell.border = border_cell
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    def _fmt_xy(x: float, y: float) -> str:
+        return f"({float(x):.2f},{float(y):.2f})"
+
+    table_row = table_top + 1
+    for m in members:
+        vals = [
+            int(m["beam_no"]),
+            str(m["beam_id"]),
+            str(m["member_type"]),
+            str(m["direction"]),
+            int(m["section_rank"]),
+            str(m["section_name"]),
+            _fmt_xy(float(m["start_x"]), float(m["start_y"])),
+            _fmt_xy(float(m["end_x"]), float(m["end_y"])),
+        ]
+        for i, v in enumerate(vals):
+            cell = ws.cell(row=table_row, column=table_left + i, value=v)
+            cell.font = font_table
+            cell.border = border_cell
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=False)
+            if bool(m["is_worst"]):
+                cell.fill = fill_worst_row
+        table_row += 1
+
     legend_r = grid_top + ny + 1
     ws.cell(row=legend_r, column=left, value="Legend:").font = Font(bold=True)
     ws.cell(row=legend_r + 1, column=left, value="MAIN beam: light-blue fill").font = font_small
     ws.cell(row=legend_r + 2, column=left, value="TRANS beam: yellow fill").font = font_small
     ws.cell(row=legend_r + 3, column=left, value="Worst utilization member: RED fill").font = font_small
-    ws.cell(row=legend_r + 4, column=left, value="Point load: red ●ID, Allocation marker: blue ▲ID (◎ID if both overlap)").font = font_small
+    ws.cell(row=legend_r + 4, column=left, value="Point load marker: red P-ID, Allocation marker: blue T-ID (P/T-ID if overlap)").font = font_small
+    ws.cell(row=legend_r + 5, column=left, value="Pin joint marker (one cell inside each end): o").font = font_small
 
-    return legend_r + 6
-
-
+    return max(legend_r + 7, table_row + 1)
 # -----------------------------
 # Main
 # -----------------------------
@@ -4408,7 +6890,6 @@ def _safe_json(obj: object) -> str:
         return json.dumps(obj, ensure_ascii=False, default=str)
     except Exception:
         return str(obj)
-
 
 def write_verbose_sheets(
     wb,
@@ -4428,15 +6909,32 @@ def write_verbose_sheets(
       - DEBUG_TRANS_DEFS : transfer beam definitions per candidate
       - DEBUG_MEMBER_FINAL : selected member checks per candidate
       - DEBUG_ALLOC_FINAL : allocations per candidate (incl. TRANS reactions)
-      - SAMPLE : arrays (x, V, M, y) for worst member of best solution
+      - DEBUG_PDF_SECTION_MAP : per-PDF-segment section mapping result
+      - DEBUG_STEP_MEMBER_LOADS : step-segment load composition and chosen section
     """
     write_trace_sheet(wb)
     write_debug_member_trials_sheet(wb)
-    write_debug_main_geoms_sheet(wb)
-    write_debug_trans_defs_sheet(wb)
-    write_debug_member_final_sheet(wb)
-    write_debug_alloc_final_sheet(wb)
-    write_sample_sheet(wb, cfg, mat, setts, sections, best)
+    if _DBG_MAIN_GEOMS:
+        write_debug_main_geoms_sheet(wb)
+    elif "DEBUG_MAIN_GEOMS" in wb.sheetnames:
+        del wb["DEBUG_MAIN_GEOMS"]
+    if _DBG_TRANS_DEFS:
+        write_debug_trans_defs_sheet(wb)
+    elif "DEBUG_TRANS_DEFS" in wb.sheetnames:
+        del wb["DEBUG_TRANS_DEFS"]
+    if _DBG_MEMBER_FINAL:
+        write_debug_member_final_sheet(wb)
+    elif "DEBUG_MEMBER_FINAL" in wb.sheetnames:
+        del wb["DEBUG_MEMBER_FINAL"]
+    if _DBG_ALLOC_FINAL:
+        write_debug_alloc_final_sheet(wb)
+    elif "DEBUG_ALLOC_FINAL" in wb.sheetnames:
+        del wb["DEBUG_ALLOC_FINAL"]
+    write_debug_pdf_section_map_sheet(wb)
+    write_debug_step_member_loads_sheet(wb)
+    # SAMPLE sheet is intentionally disabled.
+    if "SAMPLE" in wb.sheetnames:
+        del wb["SAMPLE"]
 
 
 def write_trace_sheet(wb) -> None:
@@ -4602,6 +7100,85 @@ def write_debug_alloc_final_sheet(wb) -> None:
         r += 1
 
 
+def write_debug_pdf_section_map_sheet(wb) -> None:
+    if "DEBUG_PDF_SECTION_MAP" in wb.sheetnames:
+        del wb["DEBUG_PDF_SECTION_MAP"]
+    ws = wb.create_sheet("DEBUG_PDF_SECTION_MAP")
+    headers = [
+        "case_id", "scope", "seg_id", "step", "typ", "const",
+        "x0", "y0", "x1", "y1",
+        "match_count", "chosen_rank", "chosen_section", "status",
+    ]
+    widths = [10, 8, 8, 6, 6, 10, 10, 10, 10, 10, 10, 10, 20, 14]
+    for i, w in enumerate(widths, start=1):
+        set_col_width(ws, i, w)
+    for c, h in enumerate(headers, start=1):
+        ws.cell(row=1, column=c, value=h).font = Font(bold=True)
+    r = 2
+    for d in _DBG_PDF_SECTION_MAP:
+        vals = [
+            d.get("case_id"),
+            d.get("scope"),
+            d.get("seg_id"),
+            d.get("step"),
+            d.get("typ"),
+            d.get("const"),
+            d.get("x0"),
+            d.get("y0"),
+            d.get("x1"),
+            d.get("y1"),
+            d.get("match_count"),
+            d.get("chosen_rank"),
+            d.get("chosen_section"),
+            d.get("status"),
+        ]
+        for c, v in enumerate(vals, start=1):
+            ws.cell(row=r, column=c, value=v)
+        r += 1
+
+
+def write_debug_step_member_loads_sheet(wb) -> None:
+    if "DEBUG_STEP_MEMBER_LOADS" in wb.sheetnames:
+        del wb["DEBUG_STEP_MEMBER_LOADS"]
+    ws = wb.create_sheet("DEBUG_STEP_MEMBER_LOADS")
+    headers = [
+        "case_id", "seg_id", "step", "span",
+        "left_support", "right_support",
+        "udl_model", "trib_left", "trib_right", "trib_width",
+        "point_loads_external", "point_loads_from_children",
+        "Ra", "Rb", "chosen_rank", "chosen_section", "util_max",
+    ]
+    widths = [10, 10, 6, 10, 12, 12, 10, 10, 10, 10, 34, 34, 10, 10, 10, 24, 10]
+    for i, w in enumerate(widths, start=1):
+        set_col_width(ws, i, w)
+    for c, h in enumerate(headers, start=1):
+        ws.cell(row=1, column=c, value=h).font = Font(bold=True)
+    r = 2
+    for d in _DBG_STEP_MEMBER_LOADS:
+        vals = [
+            d.get("case_id"),
+            d.get("seg_id"),
+            d.get("step"),
+            d.get("span"),
+            d.get("left_support"),
+            d.get("right_support"),
+            d.get("udl_model"),
+            d.get("trib_left"),
+            d.get("trib_right"),
+            d.get("trib_width"),
+            d.get("point_loads_external"),
+            d.get("point_loads_from_children"),
+            d.get("Ra"),
+            d.get("Rb"),
+            d.get("chosen_rank"),
+            d.get("chosen_section"),
+            d.get("util_max"),
+        ]
+        for c, v in enumerate(vals, start=1):
+            ws.cell(row=r, column=c, value=v)
+        r += 1
+
+
 def write_sample_sheet(
     wb,
     cfg: Config,
@@ -4620,85 +7197,30 @@ def write_sample_sheet(
         ws.cell(row=3, column=1, value="NO FEASIBLE SOLUTION").font = Font(bold=True)
         return
 
-    worst_id = best.worst_member_id
-    mc = next((m for m in best.member_checks if m.beam_id == worst_id), None)
+    mc, sec, ana, msg = _rebuild_member_arrays_for_best_member(cfg, mat, setts, sections, best)
     if mc is None:
-        ws.cell(row=3, column=1, value="Worst member not found").font = Font(bold=True)
+        ws.cell(row=3, column=1, value=(msg if msg else "Worst member not found")).font = Font(bold=True)
         return
 
-    sec = next((s for s in sections if s.name == mc.section_name and s.rank == mc.section_rank), None)
     if sec is None:
-        sec = next((s for s in sections if s.name == mc.section_name), None)
-    if sec is None:
-        ws.cell(row=3, column=1, value="Section not found for worst member").font = Font(bold=True)
+        ws.cell(row=3, column=1, value=(msg if msg else "Section not found for worst member")).font = Font(bold=True)
         return
 
     ws.cell(row=3, column=1, value=f"Best: dir={best.direction}, pitch={_pitch_text(best.direction, best.pitch, best.pitch_y)}").font = Font(bold=True)
-    ws.cell(row=4, column=1, value=f"Worst member: {worst_id} (No={mc.beam_no}, type={mc.member_type})").font = Font(bold=True)
+    ws.cell(row=4, column=1, value=f"Worst member: {mc.beam_id} (No={mc.beam_no}, type={mc.member_type})").font = Font(bold=True)
     ws.cell(row=5, column=1, value=f"Section: rank={sec.rank}, {sec.name}").font = Font(bold=True)
     ws.cell(row=6, column=1, value=f"util_max={mc.util_max:.3f}, Mmax={mc.Mmax:.3f} kN*m, Vmax={mc.Vmax:.3f} kN, dmax={mc.dmax*1000.0:.3f} mm").font = Font(bold=True)
 
-    # rebuild arrays by re-running check_member with return_arrays=True
-    q_for_recheck = cfg.q * (0.5 if best.direction == "XY" else 1.0)
-
-    if mc.member_type == "MAIN":
-        bg = next((b for b in best.main_geoms if b.beam_id == worst_id), None)
-        if bg is None:
-            ws.cell(row=8, column=1, value="BeamGeom not found").font = Font(bold=True)
-            return
-        bc, ana = check_member(
-            member_type="MAIN",
-            span_dir=bg.direction,
-            span=bg.span,
-            pos_or_fixed=bg.pos,
-            left=None,
-            right=None,
-            trib_width=bg.trib_width,
-            trib_left=bg.trib_left,
-            trib_right=bg.trib_right,
-            load_share_model=cfg.load_share_model,
-            q=q_for_recheck,
-            point_loads=bg.point_along,
-            section=sec,
-            mat=mat,
-            setts=setts,
-            return_arrays=True,
-        )
-    else:
-        td = next((t for t in best.transfer_defs if t.tb_id == worst_id), None)
-        if td is None:
-            ws.cell(row=8, column=1, value="TransferDef not found").font = Font(bold=True)
-            return
-        Ltb = td.right_pos - td.left_pos
-        bc, ana = check_member(
-            member_type="TRANS",
-            span_dir=td.span_dir,
-            span=Ltb,
-            pos_or_fixed=td.fixed_coord,
-            left=td.left_pos,
-            right=td.right_pos,
-            trib_width=0.0,
-            trib_left=0.0,
-            trib_right=0.0,
-            load_share_model="ONEWAY",
-            q=cfg.q,
-            point_loads=[(td.P, td.a_tb)],
-            section=sec,
-            mat=mat,
-            setts=setts,
-            return_arrays=True,
-        )
-
     if ana is None:
-        ws.cell(row=8, column=1, value="No arrays returned").font = Font(bold=True)
+        ws.cell(row=8, column=1, value=(msg if msg else "No arrays returned")).font = Font(bold=True)
         return
 
-    xs = ana.get("xs", [])
-    V = ana.get("V", [])
-    M = ana.get("M", [])
-    y = ana.get("y", [])
+    if msg:
+        ws.cell(row=8, column=1, value=msg).font = Font(italic=True)
 
-    start_r = 9
+    xs, V, M, y = _resample_ana_arrays_to_fixed_divisions(ana, n_div_out=20)
+
+    start_r = 10 if msg else 9
     headers = ["x[m]", "V[kN]", "M[kN*m]", "y[mm]"]
     for c, h in enumerate(headers, start=1):
         ws.cell(row=start_r, column=c, value=h).font = Font(bold=True)
